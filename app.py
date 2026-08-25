@@ -1,6 +1,7 @@
 import base64
 import math
 import os
+import difflib
 from datetime import datetime, timezone
 
 import cv2
@@ -22,7 +23,7 @@ app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024
 
 db = SQLAlchemy(app)
 ADMIN_KEY = os.getenv("ADMIN_KEY", "change-me")
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 
 class Link(db.Model):
     __tablename__ = "links"
@@ -77,32 +78,85 @@ def decode_gray_bytes(raw):
     arr = np.frombuffer(raw, np.uint8)
     return cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
 
-def visual_score(reference_bytes, frame_bytes):
-    ref = decode_gray_bytes(reference_bytes)
-    frame = decode_gray_bytes(frame_bytes)
-    if ref is None or frame is None:
+def _prep_binary(gray):
+    if gray is None:
+        return None
+    h, w = gray.shape[:2]
+    if h < 8 or w < 8:
+        return None
+    blur = cv2.GaussianBlur(gray, (3, 3), 0)
+    _, bw = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    pts = cv2.findNonZero(bw)
+    if pts is not None:
+        x, y, ww, hh = cv2.boundingRect(pts)
+        px, py = max(4, int(ww * 0.08)), max(4, int(hh * 0.12))
+        bw = bw[max(0,y-py):min(h,y+hh+py), max(0,x-px):min(w,x+ww+px)]
+    return bw if bw is not None and bw.size else None
+
+
+def _shape_score(ref_gray, frame_gray):
+    a, b = _prep_binary(ref_gray), _prep_binary(frame_gray)
+    if a is None or b is None:
         return 0.0
-    orb = cv2.ORB_create(nfeatures=1400, fastThreshold=8)
-    k1, d1 = orb.detectAndCompute(ref, None)
-    k2, d2 = orb.detectAndCompute(frame, None)
-    if d1 is None or d2 is None or len(k1) < 6 or len(k2) < 6:
+    cw, ch = 640, 240
+    def fit(src):
+        h, w = src.shape[:2]
+        scale = min(cw / max(1,w), ch / max(1,h))
+        nw, nh = max(1,int(w*scale)), max(1,int(h*scale))
+        r = cv2.resize(src, (nw,nh), interpolation=cv2.INTER_AREA)
+        c = np.zeros((ch,cw), np.uint8)
+        x, y = (cw-nw)//2, (ch-nh)//2
+        c[y:y+nh, x:x+nw] = r
+        return c
+    aa, bb = fit(a), fit(b)
+    aa, bb = cv2.GaussianBlur(aa,(3,3),0), cv2.GaussianBlur(bb,(3,3),0)
+    corr = max(0.0, float(cv2.matchTemplate(aa, bb, cv2.TM_CCOEFF_NORMED)[0][0]))
+    ea, eb = cv2.Canny(aa,50,140), cv2.Canny(bb,50,140)
+    inter = np.logical_and(ea>0, eb>0).sum()
+    union = np.logical_or(ea>0, eb>0).sum()
+    iou = float(inter/union) if union else 0.0
+    return min(100.0, 100.0*(0.78*corr + 0.22*iou))
+
+
+def _orb_score(ref_gray, frame_gray):
+    orb = cv2.ORB_create(nfeatures=1800, fastThreshold=6)
+    k1,d1 = orb.detectAndCompute(ref_gray,None)
+    k2,d2 = orb.detectAndCompute(frame_gray,None)
+    if d1 is None or d2 is None or len(k1)<6 or len(k2)<6:
         return 0.0
-    matches = cv2.BFMatcher(cv2.NORM_HAMMING).knnMatch(d1, d2, k=2)
-    good = [m for pair in matches if len(pair) == 2 for m, n in [pair] if m.distance < 0.72 * n.distance]
-    if len(good) < 4:
-        return min(35.0, len(good) * 8.0)
-    coverage = min(1.0, len(good) / max(12.0, min(len(k1), 40.0)))
-    inlier_ratio = 0.0
-    if len(good) >= 6:
-        src = np.float32([k1[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
-        dst = np.float32([k2[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+    matches = cv2.BFMatcher(cv2.NORM_HAMMING).knnMatch(d1,d2,k=2)
+    good = [m for pair in matches if len(pair)==2 for m,n in [pair] if m.distance < 0.74*n.distance]
+    if len(good)<4:
+        return min(30.0, len(good)*6.0)
+    coverage = min(1.0, len(good)/max(14.0,min(len(k1),45.0)))
+    inlier = 0.0
+    if len(good)>=6:
+        src = np.float32([k1[m.queryIdx].pt for m in good]).reshape(-1,1,2)
+        dst = np.float32([k2[m.trainIdx].pt for m in good]).reshape(-1,1,2)
         try:
-            _, mask = cv2.findHomography(src, dst, cv2.RANSAC, 5.0)
+            _, mask = cv2.findHomography(src,dst,cv2.RANSAC,5.0)
             if mask is not None and len(mask):
-                inlier_ratio = float(mask.sum()) / len(mask)
+                inlier = float(mask.sum())/len(mask)
         except cv2.error:
             pass
-    return round(100.0 * (0.58 * coverage + 0.42 * inlier_ratio), 1)
+    return min(100.0, 100.0*(0.56*coverage + 0.44*inlier))
+
+
+def visual_score(reference_bytes, frame_bytes):
+    ref, frame = decode_gray_bytes(reference_bytes), decode_gray_bytes(frame_bytes)
+    if ref is None or frame is None:
+        return 0.0
+    shape, orb = _shape_score(ref,frame), _orb_score(ref,frame)
+    return round(min(100.0, max(shape, 0.58*shape + 0.42*orb)),1)
+
+
+def text_similarity(a,b):
+    na, nb = norm(a), norm(b)
+    if not na or not nb: return 0.0
+    if na == nb: return 100.0
+    if na in nb or nb in na:
+        return round(88.0 + 12.0*min(len(na),len(nb))/max(1,max(len(na),len(nb))),1)
+    return round(100.0*difflib.SequenceMatcher(None,na,nb).ratio(),1)
 
 def require_admin():
     return bool(ADMIN_KEY) and request.headers.get("X-Admin-Key", "") == ADMIN_KEY
@@ -194,6 +248,52 @@ def match_visual():
         out.append(d)
     out.sort(key=lambda z: (z["score"], len(norm(z["key_text"]))), reverse=True)
     return jsonify(matches=out, version=VERSION)
+
+
+@app.post("/api/match_blocks")
+def match_blocks():
+    x = request.get_json(silent=True) or {}
+    blocks = x.get("blocks") or []
+    lat, lon = x.get("lat"), x.get("lon")
+    if not isinstance(blocks,list) or not blocks:
+        return jsonify(matches=[], diagnostics=[], version=VERSION)
+    rows = Link.query.filter_by(enabled=True).all()
+    matches, diagnostics = [], []
+    for bi, block in enumerate(blocks[:12]):
+        raw_text = str((block or {}).get("text","")).strip()
+        crop_bytes = b64_bytes((block or {}).get("crop_jpeg_base64"))
+        if len(norm(raw_text))<2 or not crop_bytes: continue
+        for r in rows:
+            ts = text_similarity(raw_text, r.key_text)
+            if ts < 52.0: continue
+            vs = visual_score(r.reference_image, crop_bytes)
+            dist, gps_ok = None, True
+            if r.use_location:
+                if lat is None or lon is None or r.latitude is None or r.longitude is None:
+                    gps_ok = False
+                else:
+                    dist = hav(float(lat),float(lon),r.latitude,r.longitude)
+                    gps_ok = dist <= r.radius_m
+            visual_ok = vs >= float(r.visual_threshold or 70)
+            passed = bool(visual_ok and gps_ok)
+            diagnostics.append({
+                "block_index":bi, "ocr_text":raw_text, "registered_text":r.key_text,
+                "display_name":r.display_name, "text_score":ts, "visual_score":vs,
+                "visual_threshold":float(r.visual_threshold or 70), "gps_ok":gps_ok,
+                "distance_m":round(dist,1) if dist is not None else None, "passed":passed
+            })
+            if not passed: continue
+            loc_bonus = max(0.0,100.0-(dist/r.radius_m*100.0)) if dist is not None and r.radius_m else 0.0
+            score = round(vs*8.0 + ts*2.0 + int(r.priority)*100.0 + loc_bonus,1)
+            d = r.public_dict(); d.update({"ocr_text":raw_text,"text_score":ts,"visual_score":vs,"distance_m":round(dist,1) if dist is not None else None,"score":score,"block_index":bi})
+            matches.append(d)
+    best = {}
+    for m in matches:
+        rid=m["id"]
+        if rid not in best or m["score"]>best[rid]["score"]: best[rid]=m
+    matches = sorted(best.values(), key=lambda z:z["score"], reverse=True)
+    diagnostics = sorted(diagnostics, key=lambda z:(1 if z["passed"] else 0, z["text_score"]+z["visual_score"]), reverse=True)[:12]
+    return jsonify(matches=matches, diagnostics=diagnostics, version=VERSION)
 
 with app.app_context():
     db.create_all()
