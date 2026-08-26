@@ -26,7 +26,7 @@ app.config["MAX_CONTENT_LENGTH"] = 15 * 1024 * 1024
 
 db = SQLAlchemy(app)
 ADMIN_KEY = os.getenv("ADMIN_KEY", "change-me")
-VERSION = "0.6.0"
+VERSION = "0.6.5"
 
 
 class Link(db.Model):
@@ -96,6 +96,33 @@ class Link(db.Model):
                 "minor_typography": profile.get("minor_typography", {}).get("font_family_probabilities", {}),
                 "color": profile.get("full_visual", {}).get("color", {}),
             },
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+
+class LiveTrace(db.Model):
+    __tablename__ = "live_traces"
+    id = db.Column(db.Integer, primary_key=True)
+    session_id = db.Column(db.String(80), nullable=False, index=True)
+    event = db.Column(db.String(80), nullable=False)
+    payload = db.Column(db.Text, nullable=False, default="{}")
+    created_at = db.Column(
+        db.DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+    def public_dict(self):
+        try:
+            p = json.loads(self.payload or "{}")
+        except Exception:
+            p = {}
+        return {
+            "id": self.id,
+            "session_id": self.session_id,
+            "event": self.event,
+            "payload": p,
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
 
@@ -618,7 +645,7 @@ INDEX_HTML = r"""<!doctype html>
 <html lang="ko">
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>LUPER Registry V0.6.0</title>
+<title>LUPER Registry V0.6.5</title>
 <style>
 body{font-family:system-ui,-apple-system,sans-serif;background:#f5f6f8;color:#17191c;margin:0}
 .w{max-width:1220px;margin:22px auto;padding:0 15px}.c{background:#fff;border:1px solid #ddd;border-radius:14px;padding:18px;margin:13px 0}
@@ -632,7 +659,7 @@ table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:8px;borde
 @media(max-width:820px){.g,.g3{grid-template-columns:1fr}.full{grid-column:auto}table{display:block;overflow:auto}}
 </style></head>
 <body><div class="w">
-<h2>LUPER LIVE Registry V0.6.0</h2>
+<h2>LUPER LIVE Registry V0.6.5</h2>
 <p><b>문자 → 후보 → 대/소분류 Typography → Visual/Logo → GPS → 5초 링크카드</b></p>
 
 <div class="c">
@@ -659,6 +686,13 @@ table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:8px;borde
 
 <div class="c">
 <h3>등록목록 / 사전분석 결과</h3><div id="state" class="muted"></div><div id="list"></div>
+</div>
+
+<div class="c">
+<h3>최근 LIVE TRACE</h3>
+<p class="muted">이미지는 저장하지 않고 OCR·후보·점수·링크카드 결과만 기록합니다.</p>
+<button type="button" onclick="loadTraces()">최근 50건 불러오기</button>
+<div id="traces" class="profile" style="margin-top:10px">TRACE 대기</div>
 </div>
 </div>
 <script>
@@ -689,6 +723,14 @@ $('f').onsubmit=async e=>{
  const x=await r.json();if(!r.ok)return alert(JSON.stringify(x));
  alert('등록 및 사전분석 완료');refresh();
 };
+
+async function loadTraces(){
+ const r=await fetch('/api/traces?limit=50',{headers:ah()});
+ if(!r.ok){$('traces').textContent='TRACE 조회 실패';return}
+ const a=await r.json();
+ $('traces').textContent=a.map(x=>`${x.created_at||''} | ${x.session_id} | ${x.event}\n${JSON.stringify(x.payload)}`).join('\n\n');
+}
+
 refresh();updateRec();
 </script></body></html>"""
 
@@ -700,7 +742,7 @@ def index():
 
 @app.get("/health")
 def health():
-    return jsonify(ok=True, version=VERSION, database=db.engine.url.get_backend_name(), entries=Link.query.count())
+    return jsonify(ok=True, version=VERSION, database=db.engine.url.get_backend_name(), entries=Link.query.count(), traces=LiveTrace.query.count())
 
 
 @app.get("/api/entries")
@@ -770,6 +812,15 @@ def delete_entry(item_id):
     return jsonify(ok=True)
 
 
+@app.get("/api/index")
+def registry_index():
+    rows=Link.query.filter_by(enabled=True).order_by(Link.priority.desc(),Link.id.desc()).all()
+    data=[]
+    for r in rows:
+        f=r.fields()
+        data.append({"id":r.id,"major_category":f["major_category"],"minor_category":f["minor_category"],"recognition_terms":build_recognition_terms(f["major_category"],f["minor_category"]),"priority":r.priority})
+    return jsonify(entries=data,version=VERSION)
+
 @app.post("/api/candidates")
 def candidates():
     x = request.get_json(silent=True) or {}
@@ -792,15 +843,15 @@ def candidates():
 def verify():
     x = request.get_json(silent=True) or {}
     lat, lon = x.get("lat"), x.get("lon")
-    candidate_ids = [int(v) for v in (x.get("candidate_ids") or [])[:8]]
+    candidate_ids = [int(v) for v in (x.get("candidate_ids") or [])[:3]]
     crops = x.get("crops") or []
 
     crop_items = []
-    for c in crops[:16]:
+    for c in crops[:9]:
         raw = b64_bytes((c or {}).get("image_base64"))
         text = str((c or {}).get("text", "")).strip()
         if raw and decode_gray(raw) is not None:
-            crop_items.append((text, raw))
+            crop_items.append((text, raw, int((c or {}).get("frame_index", 0))))
 
     results, diagnostics = [], []
     for cid in candidate_ids:
@@ -816,9 +867,10 @@ def verify():
         best_major = (0.0, "", None)
         best_minor = (0.0, "", None)
         best_visual = (0.0, "", 0.0, 0.0, 0.0)
+        frame_visuals = {}
 
         # Typography compares only candidate-relevant crops.
-        for txt, raw in crop_items:
+        for txt, raw, frame_index in crop_items:
             maj_text = best_term_score(txt, f["major_category"])
             if maj_text >= 48:
                 typ = typography_similarity(profile.get("major_typography", {}), typography_features(raw))
@@ -835,15 +887,25 @@ def verify():
             variant, sh, orb, vs = profile_visual_score(row, raw)
             if vs > best_visual[0]:
                 best_visual = (vs, variant, sh, orb, vs)
+            prev = frame_visuals.get(frame_index)
+            if prev is None or vs > prev[0]:
+                frame_visuals[frame_index] = (vs, variant, sh, orb)
 
         # Full registration mode controls visual weight / floor.
         mode = row.match_mode or profile.get("mode") or "TEXT_TYPOGRAPHY"
         major_typ = best_major[0]
         minor_typ = best_minor[0] if f["minor_category"] else 100.0
-        visual = best_visual[0]
+        visual_values = sorted((v[0] for v in frame_visuals.values()), reverse=True)
+        if len(visual_values) >= 2:
+            # 3컷 중 한 장의 우연한 고득점보다 반복되는 시각 증거를 우선.
+            visual = sum(visual_values[:2]) / 2.0
+        elif visual_values:
+            visual = visual_values[0]
+        else:
+            visual = 0.0
 
         # Recompute text evidence from crop texts for final score.
-        tc = candidate_score([t for t, _ in crop_items], row)
+        tc = candidate_score([t for t, _, _ in crop_items], row)
         text_score = tc["text_score"]
 
         if mode == "LOGO_ONLY":
@@ -887,6 +949,7 @@ def verify():
             "visual_score": round(visual, 1),
             "visual_floor": round(visual_floor, 1),
             "best_visual_variant": best_visual[1],
+            "visual_frames": len(frame_visuals),
             "final_confidence": round(final_conf, 1),
             "gps_ok": gok,
             "distance_m": dist,
@@ -899,6 +962,35 @@ def verify():
     results.sort(key=lambda q: (q["final_confidence"], q["text_score"]), reverse=True)
     diagnostics.sort(key=lambda q: (q["passed"], q["final_confidence"]), reverse=True)
     return jsonify(matches=results, diagnostics=diagnostics, version=VERSION)
+
+
+
+@app.post("/api/trace")
+def trace_event():
+    x = request.get_json(silent=True) or {}
+    sid = str(x.get("session_id", "")).strip()
+    event = str(x.get("event", "")).strip()
+    payload = x.get("payload") or {}
+    if not sid or not event:
+        return jsonify(error="session_id/event required"), 400
+    # raw images are deliberately not accepted/stored.
+    item = LiveTrace(
+        session_id=sid[:80],
+        event=event[:80],
+        payload=json.dumps(payload, ensure_ascii=False)[:12000],
+    )
+    db.session.add(item)
+    db.session.commit()
+    return jsonify(ok=True)
+
+
+@app.get("/api/traces")
+def traces():
+    if not require_admin():
+        return jsonify(error="unauthorized"), 401
+    limit = min(max(int(request.args.get("limit", 50)), 1), 200)
+    rows = LiveTrace.query.order_by(LiveTrace.id.desc()).limit(limit).all()
+    return jsonify([r.public_dict() for r in rows])
 
 
 def migrate():
