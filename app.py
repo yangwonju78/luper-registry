@@ -26,7 +26,7 @@ app.config["MAX_CONTENT_LENGTH"] = 15 * 1024 * 1024
 
 db = SQLAlchemy(app)
 ADMIN_KEY = os.getenv("ADMIN_KEY", "change-me")
-VERSION = "0.7.2"
+VERSION = "0.8.0"
 
 
 class Link(db.Model):
@@ -62,14 +62,17 @@ class Link(db.Model):
     )
 
     def fields(self):
-        major = (self.major_category or self.key_text or "").strip()
-        minor = (self.minor_category or "").strip()
+        registration=(self.registration_name or self.display_name or self.key_text or "").strip()
+        display=(self.display_name or registration).strip()
+        try:p=json.loads(self.identity_profile or "{}")
+        except Exception:p={}
+        hints=p.get("context",{}).get("recognition_terms") or context_recognition_terms(registration,display)
         return {
-            "registration_name": (self.registration_name or self.display_name or major).strip(),
-            "major_category": major,
-            "minor_category": minor,
-            "recognition_text": (self.recognition_text or build_recognition_text(major, minor)).strip(),
-            "display_name": (self.display_name or major).strip(),
+            "registration_name":registration,
+            "major_category":(self.major_category or "").strip(),
+            "minor_category":(self.minor_category or "").strip(),
+            "recognition_text":" | ".join(hints),
+            "display_name":display,
         }
 
     def public_dict(self):
@@ -92,9 +95,11 @@ class Link(db.Model):
             "visual_threshold": self.visual_threshold,
             "profile_summary": {
                 "mode": profile.get("mode"),
-                "major_typography": profile.get("major_typography", {}).get("font_family_probabilities", {}),
-                "minor_typography": profile.get("minor_typography", {}).get("font_family_probabilities", {}),
+                "hint_tokens": profile.get("context", {}).get("hint_tokens", []),
+                "primary_typography": profile.get("regions", {}).get("primary", {}).get("typography", {}).get("font_family_probabilities", {}),
+                "secondary_typography": profile.get("regions", {}).get("secondary", {}).get("typography", {}).get("font_family_probabilities", {}),
                 "color": profile.get("full_visual", {}).get("color", {}),
+                "sift_features": profile.get("full_visual", {}).get("sift", {}).get("count", 0),
             },
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
@@ -126,6 +131,75 @@ class LiveTrace(db.Model):
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
 
+
+
+def context_tokens(registration_name, display_name):
+    generic={"로고","logo","이미지","image","사진","전면","후면","정면","메뉴","링크","공식","사이트","홈페이지","사용설명서","설명서","as","서비스","페이지"}
+    raw=f"{registration_name or ''} {display_name or ''}"
+    parts=re.findall(r"[가-힣A-Za-z]+|\d{2,}",raw)
+    out=[]
+    for p in parts:
+        q=p.strip()
+        if not q or q.lower() in generic: continue
+        if len(q)==1 and not q.isdigit(): continue
+        out.append(q)
+    return list(dict.fromkeys(out))
+
+def context_recognition_terms(registration_name, display_name):
+    toks=context_tokens(registration_name,display_name)
+    terms=list(toks)
+    for i in range(len(toks)-1):
+        terms += [toks[i]+toks[i+1], toks[i]+" "+toks[i+1]]
+    if len(toks)>=2: terms += [" ".join(toks), "".join(toks)]
+    return list(dict.fromkeys(terms))
+
+def region_profile(raw):
+    if not raw:return {}
+    return {"typography":typography_features(raw),"color":color_profile(raw),"sift":sift_fingerprint(raw)}
+
+def analyze_registration_image(full_raw,registration_name,display_name):
+    primary_raw,secondary_raw=detect_text_bands(full_raw)
+    p={
+      "profile_version":"3.0",
+      "source":"IMAGE_AUTO_ANALYSIS",
+      "context":{
+        "registration_name":registration_name,
+        "display_name":display_name,
+        "hint_tokens":context_tokens(registration_name,display_name),
+        "recognition_terms":context_recognition_terms(registration_name,display_name),
+        "note":"Context is a retrieval hint, not proof of image text."
+      },
+      "regions":{
+        "primary":region_profile(primary_raw) if primary_raw else {},
+        "secondary":region_profile(secondary_raw) if secondary_raw else {}
+      },
+      "full_visual":{
+        "color":color_profile(full_raw),
+        "typography":typography_features(full_raw),
+        "sift":sift_fingerprint(full_raw),
+        "variants":generate_variants(full_raw)
+      },
+      "mode":"CONTEXT_VISUAL"
+    }
+    return p,primary_raw,secondary_raw
+
+def registration_analysis_summary(profile):
+    def top(region):
+        probs=(region or {}).get("typography",{}).get("font_family_probabilities",{})
+        return max(probs.items(),key=lambda kv:kv[1]) if probs else None
+    p=profile.get("regions",{}).get("primary",{})
+    q=profile.get("regions",{}).get("secondary",{})
+    return {
+      "mode":profile.get("mode"),
+      "hint_tokens":profile.get("context",{}).get("hint_tokens",[]),
+      "recognition_terms":profile.get("context",{}).get("recognition_terms",[]),
+      "primary_detected":bool(p),
+      "secondary_detected":bool(q),
+      "primary_font_top":top(p),
+      "secondary_font_top":top(q),
+      "full_color":profile.get("full_visual",{}).get("color",{}),
+      "sift_features":profile.get("full_visual",{}).get("sift",{}).get("count",0),
+    }
 
 # -------------------------- text / hangul --------------------------
 
@@ -808,138 +882,57 @@ def gps_ok(row, lat, lon):
     return d <= row.radius_m, round(d, 1)
 
 
-def candidate_score(ocr_texts, row):
-    f = row.fields()
-    major_scores = [(best_term_score(t, f["major_category"]), t) for t in ocr_texts]
-    major_score, major_ocr = max(major_scores, default=(0.0, ""))
-
-    minors = split_terms(f["minor_category"])
-    minor_hits = []
-    for target in minors:
-        best = max((best_term_score(t, target), t) for t in ocr_texts) if ocr_texts else (0.0, "")
-        minor_hits.append({"target": target, "score": round(best[0], 1), "ocr": best[1]})
-
-    if minors:
-        # 하나의 긴 소분류 문자열이 아니라, 등록된 소분류 토큰 중 보이는 증거를 활용.
-        good = [h["score"] for h in minor_hits if h["score"] >= 58]
-        minor_score = sum(sorted(good, reverse=True)[:3]) / min(3, len(minors)) if good else 0.0
-        minor_coverage = len(good) / len(minors)
-    else:
-        minor_score = 100.0
-        minor_coverage = 1.0
-
-    # 대분류는 기준축. 소분류가 존재할 경우 최소 하나 이상의 증거를 요구.
-    major_ok = major_score >= 58.0
-    minor_ok = (not minors) or any(h["score"] >= 58.0 for h in minor_hits)
-
-    combined = major_score * 0.70 + minor_score * 0.30
-    if major_score >= 82:
-        combined += 4.0
+def candidate_score(ocr_texts,row):
+    f=row.fields()
+    try:p=json.loads(row.identity_profile or "{}")
+    except Exception:p={}
+    terms=p.get("context",{}).get("recognition_terms") or context_recognition_terms(f["registration_name"],f["display_name"])
+    if not terms:terms=[f["registration_name"],f["display_name"]]
+    ranked=[]
+    for target in terms:
+        best=max((best_term_score(t,target),t) for t in ocr_texts) if ocr_texts else (0.0,"")
+        ranked.append({"target":target,"score":round(best[0],1),"ocr":best[1]})
+    ranked.sort(key=lambda x:x["score"],reverse=True)
+    best=ranked[0]["score"] if ranked else 0.0
+    second=ranked[1]["score"] if len(ranked)>1 else 0.0
     return {
-        "major_score": round(min(100, major_score), 1),
-        "major_ocr": major_ocr,
-        "minor_score": round(min(100, minor_score), 1),
-        "minor_coverage": round(minor_coverage, 3),
-        "minor_hits": minor_hits,
-        "text_score": round(min(100, combined), 1),
-        "eligible": bool(major_ok and minor_ok),
+      "major_score":round(best,1),"major_ocr":ranked[0]["ocr"] if ranked else "",
+      "minor_score":round(second,1),"minor_coverage":0.0,"minor_hits":ranked[:5],
+      "text_score":round(min(100,best*.82+second*.18),1),
+      "eligible":bool(best>=48.0),"context_hits":ranked[:5]
     }
 
 
 # -------------------------- routes --------------------------
 
-INDEX_HTML = r"""<!doctype html>
-<html lang="ko">
-<head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>LUPER Registry V0.7.2</title>
-<style>
-body{font-family:system-ui,-apple-system,sans-serif;background:#f5f6f8;color:#17191c;margin:0}
-.w{max-width:1220px;margin:22px auto;padding:0 15px}.c{background:#fff;border:1px solid #ddd;border-radius:14px;padding:18px;margin:13px 0}
-.g{display:grid;grid-template-columns:1fr 1fr;gap:12px}.g3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px}
-label{display:block;font-size:13px;color:#555;margin-bottom:5px}input,select{width:100%;box-sizing:border-box;padding:10px;border:1px solid #ccd1d7;border-radius:8px}
-.full{grid-column:1/-1}.row{display:flex;gap:8px;align-items:center}.row input[type=checkbox]{width:auto}
-button{border:0;border-radius:8px;background:#111;color:#fff;font-weight:700;padding:10px 13px;cursor:pointer}
-.muted{font-size:13px;color:#666}.ok{color:#18723a;font-weight:700}.warn{color:#a22;font-weight:700}
-table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:8px;border-bottom:1px solid #eee;text-align:left;vertical-align:top}
-.profile{white-space:pre-wrap;font:12px/1.5 ui-monospace,monospace;background:#101114;color:#eee;padding:10px;border-radius:8px}
-@media(max-width:820px){.g,.g3{grid-template-columns:1fr}.full{grid-column:auto}table{display:block;overflow:auto}}
-</style></head>
-<body><div class="w">
-<h2>LUPER LIVE Registry V0.7.2</h2>
-<p><b>문자 → 후보 → Typography → SIFT+Homography Visual ID 확정 → GPS → 5초 링크카드</b></p>
-
-<div class="c">
-<label>관리자 키</label><div class="row"><input id="admin" type="password"><button id="saveKey">키 저장</button></div>
-</div>
-
+INDEX_HTML = r"""<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>LUPER Registry V0.8.0</title><style>
+body{font-family:system-ui;background:#f5f6f8;margin:0}.w{max-width:1100px;margin:22px auto;padding:0 15px}.c{background:#fff;border:1px solid #ddd;border-radius:14px;padding:18px;margin:13px 0}.g{display:grid;grid-template-columns:1fr 1fr;gap:12px}.full{grid-column:1/-1}label{display:block;font-size:13px;color:#555;margin-bottom:5px}input{width:100%;box-sizing:border-box;padding:10px;border:1px solid #ccd1d7;border-radius:8px}button{border:0;border-radius:8px;background:#111;color:#fff;font-weight:700;padding:10px 13px}.muted{font-size:13px;color:#666}.profile{white-space:pre-wrap;font:12px/1.5 monospace;background:#101114;color:#eee;padding:10px;border-radius:8px}.preview{display:flex;gap:12px;flex-wrap:wrap}.preview img{max-width:320px;max-height:170px;border:1px solid #ddd;border-radius:8px}table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:8px;border-bottom:1px solid #eee;text-align:left}@media(max-width:820px){.g{grid-template-columns:1fr}.full{grid-column:auto}}
+</style></head><body><div class="w">
+<h2>LUPER Registry V0.8.0</h2><p><b>Context Hint + Image Identity Profile</b></p>
+<p class="muted">사용자는 등록명·표시명·URL·이미지만 제공합니다. 등록명과 표시명은 후보 검색을 돕는 힌트이고, 이미지의 시각 구조와 SIFT 특징은 원본에서 자동 생성합니다.</p>
+<div class="c"><label>관리자 키</label><div style="display:flex;gap:8px"><input id="admin" type="password"><button id="saveKey">키 저장</button></div></div>
 <div class="c"><form id="f"><div class="g">
-<div><label>등록명</label><input id="regname" required placeholder="살만온족발_메뉴_01"></div>
-<div><label>표시명</label><input id="display" required placeholder="살만온족발 메뉴"></div>
-<div><label>대분류 · 기준 문자/상호</label><input id="major" required placeholder="살만온족발"></div>
-<div><label>소분류 · 보조 문자</label><input id="minor" placeholder="족발 보쌈 닭발"></div>
-<div class="full"><label>인식문자 · 자동 생성</label><input id="recognition" disabled></div>
+<div><label>등록명 · 분석 힌트</label><input id="regname" required placeholder="살만온족발 로고 / 비스포크 냉장고 2026"></div>
+<div><label>표시명 · 링크카드 표시</label><input id="display" required placeholder="살만온족발 메뉴"></div>
 <div class="full"><label>URL</label><input id="url" required placeholder="https://..."></div>
-<div class="full"><label>전체 기준 이미지</label><input id="fullImg" type="file" accept="image/*" required></div>
-<div><label>대분류 문자 Crop (선택 · 없으면 자동추정)</label><input id="majorImg" type="file" accept="image/*"></div>
-<div><label>소분류 문자 Crop (선택 · 없으면 자동추정)</label><input id="minorImg" type="file" accept="image/*"></div>
-<div><label>등록 유형</label><select id="mode"><option value="auto">자동</option><option value="TEXT_TYPOGRAPHY">문자+글자체 중심</option><option value="WORDMARK_OR_TEXT">워드마크/문자</option><option value="TEXT_LOGO">문자+로고</option><option value="LOGO_ONLY">로고만</option></select></div>
-<div><label>기본 Visual 기준</label><input id="thr" type="number" value="48" min="0" max="100"></div>
-<div class="row"><input id="useGps" type="checkbox"><label for="useGps" style="margin:0">GPS 사용</label></div>
-<div><label>반경(m)</label><input id="radius" type="number" value="150"></div>
-<div><label>위도</label><input id="lat" type="number" step="any"></div><div><label>경도</label><input id="lon" type="number" step="any"></div>
-<div class="full"><button>등록 + 원본 사전분석</button></div>
+<div class="full"><label>기준 이미지</label><input id="fullImg" type="file" accept="image/*" required></div>
+<div class="full" style="display:flex;gap:8px"><button type="button" id="analyze">이미지 사전분석</button><button type="submit">등록</button></div>
 </div></form></div>
-
-<div class="c">
-<h3>등록목록 / 사전분석 결과</h3><div id="state" class="muted"></div><div id="list"></div>
-</div>
-
-<div class="c">
-<h3>최근 LIVE TRACE</h3>
-<p class="muted">이미지는 저장하지 않고 OCR·후보·점수·링크카드 결과만 기록합니다.</p>
-<button type="button" onclick="loadTraces()">최근 50건 불러오기</button>
-<div id="traces" class="profile" style="margin-top:10px">TRACE 대기</div>
-</div>
-</div>
-<script>
-const $=id=>document.getElementById(id), esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-$('admin').value=sessionStorage.getItem('luper_admin')||'';
-$('saveKey').onclick=()=>{sessionStorage.setItem('luper_admin',$('admin').value);refresh()};
-const ah=()=>({'X-Admin-Key':$('admin').value});
+<div class="c"><h3>이미지 사전분석</h3><div id="analysis" class="muted">이미지를 선택한 뒤 분석하세요.</div><div id="previews" class="preview"></div></div>
+<div class="c"><h3>등록목록</h3><div id="state"></div><div id="list"></div></div>
+<div class="c"><h3>최근 LIVE TRACE</h3><button type="button" onclick="loadTraces()">최근 50건</button><div id="traces" class="profile">TRACE 대기</div></div>
+</div><script>
+const $=id=>document.getElementById(id),esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+$('admin').value=sessionStorage.getItem('luper_admin')||'';$('saveKey').onclick=()=>{sessionStorage.setItem('luper_admin',$('admin').value);refresh()};const ah=()=>({'X-Admin-Key':$('admin').value});
 function file64(f){return new Promise((ok,no)=>{if(!f)return ok(null);let r=new FileReader();r.onload=()=>ok(r.result);r.onerror=no;r.readAsDataURL(f)})}
-function updateRec(){const a=$('major').value.trim(), b=$('minor').value.trim();const ms=b.split(/[\s,|/·]+/).filter(Boolean);let t=[];if(a)t.push(a);for(const m of ms){t.push(m);if(a){t.push(a+' '+m);t.push(a+m)}}$('recognition').value=[...new Set(t)].join(' | ')}
-$('major').oninput=updateRec;$('minor').oninput=updateRec;
+async function payload(){return{registration_name:$('regname').value.trim(),display_name:$('display').value.trim(),url:$('url').value.trim(),reference_image_base64:await file64($('fullImg').files[0])}}
+$('analyze').onclick=async()=>{const b=await payload();const r=await fetch('/api/analyze_registration',{method:'POST',headers:{'Content-Type':'application/json','X-Admin-Key':$('admin').value},body:JSON.stringify(b)});const x=await r.json();if(!r.ok)return alert(JSON.stringify(x));$('analysis').innerHTML=`힌트: ${esc((x.summary.hint_tokens||[]).join(' / '))}<br>후보어: ${esc((x.summary.recognition_terms||[]).join(' | '))}<br>PRIMARY: ${x.summary.primary_detected?'검출':'없음'} ${esc(JSON.stringify(x.summary.primary_font_top))}<br>SECONDARY: ${x.summary.secondary_detected?'검출':'없음'} ${esc(JSON.stringify(x.summary.secondary_font_top))}<br>색상: ${esc(JSON.stringify(x.summary.full_color))}<br>SIFT: ${x.summary.sift_features}`;$('previews').innerHTML=(x.primary_preview?`<div>PRIMARY<br><img src="${x.primary_preview}"></div>`:'')+(x.secondary_preview?`<div>SECONDARY<br><img src="${x.secondary_preview}"></div>`:'')};
+$('f').onsubmit=async e=>{e.preventDefault();const b=await payload();const r=await fetch('/api/entries',{method:'POST',headers:{'Content-Type':'application/json','X-Admin-Key':$('admin').value},body:JSON.stringify(b)});const x=await r.json();if(!r.ok)return alert(JSON.stringify(x));alert('등록 완료');refresh()};
+async function refresh(){const h=await(await fetch('/health')).json();$('state').textContent=`ONLINE V${h.version} · ${h.entries}개`;const r=await fetch('/api/entries',{headers:ah()});if(!r.ok)return;const a=await r.json();let t='<table><tr><th>등록명</th><th>표시명</th><th>Hint</th><th>Profile</th><th>URL</th></tr>';for(const x of a)t+=`<tr><td>${esc(x.registration_name)}</td><td>${esc(x.display_name)}</td><td>${esc((x.profile_summary?.hint_tokens||[]).join(' / '))}</td><td>${esc(x.profile_summary?.mode||'')} / SIFT ${esc(x.profile_summary?.sift_features||0)}</td><td><a href="${esc(x.url)}" target="_blank">열기</a></td></tr>`;$('list').innerHTML=t+'</table>'}
+async function loadTraces(){const r=await fetch('/api/traces?limit=50',{headers:ah()});if(!r.ok)return;$('traces').textContent=(await r.json()).map(x=>`${x.created_at||''} | ${x.session_id} | ${x.event}\n${JSON.stringify(x.payload)}`).join('\n\n')}
+refresh();</script></body></html>"""
 
-async function refresh(){
- const h=await (await fetch('/health')).json();$('state').innerHTML=`<span class="ok">ONLINE</span> V${h.version} · ${h.entries}개`;
- const r=await fetch('/api/entries',{headers:ah()});if(r.status===401){$('list').innerHTML='<p class="warn">관리자 키를 저장하세요.</p>';return}
- const a=await r.json();let s='<table><tr><th>등록명</th><th>대분류</th><th>소분류</th><th>자동 인식문자</th><th>타이포그래피</th><th>유형</th><th>URL</th><th></th></tr>';
- for(const x of a){
-  const M=x.profile_summary?.major_typography||{}, m=x.profile_summary?.minor_typography||{};
-  s+=`<tr><td><b>${esc(x.registration_name)}</b></td><td>${esc(x.major_category)}</td><td>${esc(x.minor_category)}</td><td>${esc(x.recognition_text)}</td><td>대: ${esc(JSON.stringify(M))}<br>소: ${esc(JSON.stringify(m))}</td><td>${esc(x.profile_summary?.mode||x.match_mode)}</td><td><a href="${esc(x.url)}" target="_blank">열기</a></td><td><button onclick="delx(${x.id})">삭제</button></td></tr>`;
- }
- $('list').innerHTML=s+'</table>';
-}
-async function delx(id){if(!confirm('삭제할까요?'))return;await fetch('/api/entries/'+id,{method:'DELETE',headers:ah()});refresh()}
-$('f').onsubmit=async e=>{
- e.preventDefault();if(!$('admin').value)return alert('관리자 키를 저장하세요.');
- const body={registration_name:$('regname').value,display_name:$('display').value,major_category:$('major').value,minor_category:$('minor').value,url:$('url').value,match_mode:$('mode').value,visual_threshold:+$('thr').value||48,use_location:$('useGps').checked,radius_m:+$('radius').value||150,latitude:$('lat').value?+$('lat').value:null,longitude:$('lon').value?+$('lon').value:null,
- reference_image_base64:await file64($('fullImg').files[0]),major_image_base64:await file64($('majorImg').files[0]),minor_image_base64:await file64($('minorImg').files[0])};
- const r=await fetch('/api/entries',{method:'POST',headers:{'Content-Type':'application/json','X-Admin-Key':$('admin').value},body:JSON.stringify(body)});
- const x=await r.json();if(!r.ok)return alert(JSON.stringify(x));
- alert('등록 및 사전분석 완료');refresh();
-};
-
-async function loadTraces(){
- const r=await fetch('/api/traces?limit=50',{headers:ah()});
- if(!r.ok){$('traces').textContent='TRACE 조회 실패';return}
- const a=await r.json();
- $('traces').textContent=a.map(x=>`${x.created_at||''} | ${x.session_id} | ${x.event}\n${JSON.stringify(x.payload)}`).join('\n\n');
-}
-
-refresh();updateRec();
-</script></body></html>"""
 
 
 @app.get("/")
@@ -960,51 +953,35 @@ def entries():
     return jsonify([r.public_dict() for r in rows])
 
 
+@app.post("/api/analyze_registration")
+def analyze_registration():
+    if not require_admin():return jsonify(error="unauthorized"),401
+    x=request.get_json(silent=True) or {}
+    rn=str(x.get("registration_name","")).strip();dn=str(x.get("display_name","")).strip()
+    raw=b64_bytes(x.get("reference_image_base64"))
+    if not rn or not dn or not raw or decode_gray(raw) is None:
+        return jsonify(error="등록명/표시명/기준이미지가 필요합니다."),400
+    p,pr,sr=analyze_registration_image(raw,rn,dn)
+    enc=lambda z:("data:image/jpeg;base64,"+base64.b64encode(z).decode("ascii")) if z else None
+    return jsonify(ok=True,version=VERSION,summary=registration_analysis_summary(p),primary_preview=enc(pr),secondary_preview=enc(sr))
+
 @app.post("/api/entries")
 def create_entry():
-    if not require_admin():
-        return jsonify(error="unauthorized"), 401
-    x = request.get_json(silent=True) or {}
-    major = str(x.get("major_category", "")).strip()
-    minor = str(x.get("minor_category", "")).strip()
-    if not all([x.get("registration_name"), x.get("display_name"), major, x.get("url"), x.get("reference_image_base64")]):
-        return jsonify(error="등록명/표시명/대분류/URL/전체 기준이미지는 필수입니다."), 400
-
-    full_raw = b64_bytes(x.get("reference_image_base64"))
-    major_raw = b64_bytes(x.get("major_image_base64"))
-    minor_raw = b64_bytes(x.get("minor_image_base64"))
-    if decode_gray(full_raw) is None:
-        return jsonify(error="전체 기준이미지를 읽을 수 없습니다."), 400
-
-    profile = build_identity_profile(full_raw, major_raw, minor_raw, major, minor)
-    mode = str(x.get("match_mode") or "auto")
-    if mode == "auto":
-        mode = profile.get("mode") or "TEXT_TYPOGRAPHY"
-    profile["mode"] = mode
-
-    item = Link(
-        key_text=major,
-        registration_name=str(x["registration_name"]).strip(),
-        major_category=major,
-        minor_category=minor,
-        recognition_text=build_recognition_text(major, minor),
-        display_name=str(x["display_name"]).strip(),
-        url=str(x["url"]).strip(),
-        match_mode=mode,
-        reference_image=full_raw,
-        major_reference=major_raw,
-        minor_reference=minor_raw,
-        visual_threshold=float(x.get("visual_threshold") or 48),
-        priority=int(x.get("priority") or 0),
-        use_location=bool(x.get("use_location")),
-        latitude=float(x["latitude"]) if x.get("latitude") is not None else None,
-        longitude=float(x["longitude"]) if x.get("longitude") is not None else None,
-        radius_m=float(x.get("radius_m") or 150),
-        identity_profile=json.dumps(profile, ensure_ascii=False),
-    )
-    db.session.add(item)
-    db.session.commit()
-    return jsonify(item.public_dict()), 201
+    if not require_admin():return jsonify(error="unauthorized"),401
+    x=request.get_json(silent=True) or {}
+    rn=str(x.get("registration_name","")).strip();dn=str(x.get("display_name","")).strip();url=str(x.get("url","")).strip()
+    raw=b64_bytes(x.get("reference_image_base64"))
+    if not rn or not dn or not url or not raw:return jsonify(error="등록명/표시명/URL/기준이미지는 필수입니다."),400
+    if decode_gray(raw) is None:return jsonify(error="기준이미지를 읽을 수 없습니다."),400
+    p,pr,sr=analyze_registration_image(raw,rn,dn)
+    hints=p.get("context",{}).get("recognition_terms",[])
+    item=Link(key_text=rn,registration_name=rn,major_category="",minor_category="",recognition_text=" | ".join(hints),
+      display_name=dn,url=url,match_mode="CONTEXT_VISUAL",reference_image=raw,major_reference=pr,minor_reference=sr,
+      visual_threshold=48.0,priority=int(x.get("priority") or 0),use_location=bool(x.get("use_location")),
+      latitude=float(x["latitude"]) if x.get("latitude") is not None else None,
+      longitude=float(x["longitude"]) if x.get("longitude") is not None else None,
+      radius_m=float(x.get("radius_m") or 150),identity_profile=json.dumps(p,ensure_ascii=False))
+    db.session.add(item);db.session.commit();return jsonify(item.public_dict()),201
 
 
 @app.delete("/api/entries/<int:item_id>")
@@ -1025,8 +1002,12 @@ def registry_index():
     data=[]
     for r in rows:
         f=r.fields()
-        data.append({"id":r.id,"major_category":f["major_category"],"minor_category":f["minor_category"],"recognition_terms":build_recognition_terms(f["major_category"],f["minor_category"]),"priority":r.priority})
+        try:p=json.loads(r.identity_profile or "{}")
+        except Exception:p={}
+        terms=p.get("context",{}).get("recognition_terms") or context_recognition_terms(f["registration_name"],f["display_name"])
+        data.append({"id":r.id,"registration_name":f["registration_name"],"display_name":f["display_name"],"recognition_terms":terms,"priority":r.priority,"match_mode":r.match_mode or "CONTEXT_VISUAL"})
     return jsonify(entries=data,version=VERSION)
+
 
 @app.post("/api/candidates")
 def candidates():
@@ -1045,6 +1026,75 @@ def candidates():
     out.sort(key=lambda q: (q["text_score"], q["priority"]), reverse=True)
     return jsonify(candidates=out[:8], version=VERSION)
 
+
+
+@app.post("/api/fast_verify")
+def fast_verify():
+    started = datetime.now(timezone.utc)
+    x = request.get_json(silent=True) or {}
+    candidate_ids = [int(v) for v in (x.get("candidate_ids") or [])[:3]]
+    frame_raw = b64_bytes(x.get("image_base64"))
+    lat, lon = x.get("lat"), x.get("lon")
+
+    if not candidate_ids or not frame_raw or decode_gray(frame_raw) is None:
+        return jsonify(matches=[], diagnostics=[], elapsed_ms=0, version=VERSION)
+
+    matches = []
+    diagnostics = []
+
+    for cid in candidate_ids:
+        row = db.session.get(Link, cid)
+        if not row or not row.enabled:
+            continue
+
+        # SIFT fingerprint only. No typography, no ORB, no shape unless SIFT is weak.
+        try:
+            p = json.loads(row.identity_profile or "{}")
+        except Exception:
+            p = {}
+        fp = p.get("full_visual", {}).get("sift", {})
+        if not fp:
+            fp = sift_fingerprint(row.reference_image)
+
+        sd = sift_homography_score_from_fp(fp, frame_raw)
+        visual = float(sd.get("score", 0.0))
+        gok, dist = gps_ok(row, lat, lon)
+
+        strong = bool(
+            sd.get("homography")
+            and sd.get("inliers", 0) >= 18
+            and sd.get("inlier_ratio", 0) >= 0.68
+            and visual >= 82.0
+        )
+
+        f = row.fields()
+        d = {
+            "id": row.id,
+            "registration_name": f["registration_name"],
+            "display_name": f["display_name"],
+            "major_category": f["major_category"],
+            "minor_category": f["minor_category"],
+            "url": row.url,
+            "visual_method": "SIFT_FAST_ONLY",
+            "visual_score": round(visual, 1),
+            "sift_good_matches": sd.get("good_matches", 0),
+            "sift_inliers": sd.get("inliers", 0),
+            "sift_inlier_ratio": sd.get("inlier_ratio", 0),
+            "sift_median_error": sd.get("median_error"),
+            "sift_coverage": sd.get("coverage", 0),
+            "gps_ok": gok,
+            "distance_m": dist,
+            "passed": bool(strong and gok),
+            "final_confidence": round(visual, 1),
+            "fast_path": True,
+        }
+        diagnostics.append(d)
+        if d["passed"]:
+            matches.append(d)
+
+    matches.sort(key=lambda q: q["visual_score"], reverse=True)
+    elapsed = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
+    return jsonify(matches=matches, diagnostics=diagnostics, elapsed_ms=elapsed, version=VERSION)
 
 @app.post("/api/verify")
 def verify():
@@ -1275,21 +1325,16 @@ def migrate():
         except Exception:
             current = {}
         needs_rebuild = (
-            not current or
+            not current or current.get("profile_version")!="3.0" or
             not current.get("full_visual", {}).get("sift", {}).get("npz_b64")
         )
         if needs_rebuild:
             try:
-                p = build_identity_profile(
-                    row.reference_image,
-                    row.major_reference,
-                    row.minor_reference,
-                    f["major_category"],
-                    f["minor_category"],
-                )
-                if row.match_mode and row.match_mode != "auto":
-                    p["mode"] = row.match_mode
-                row.identity_profile = json.dumps(p, ensure_ascii=False)
+                p,pr,sr=analyze_registration_image(row.reference_image,f["registration_name"],f["display_name"])
+                row.identity_profile=json.dumps(p,ensure_ascii=False)
+                row.major_reference=pr;row.minor_reference=sr
+                row.match_mode="CONTEXT_VISUAL"
+                row.recognition_text=" | ".join(p.get("context",{}).get("recognition_terms",[]))
                 changed = True
             except Exception:
                 pass
