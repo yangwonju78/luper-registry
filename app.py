@@ -26,7 +26,7 @@ app.config["MAX_CONTENT_LENGTH"] = 15 * 1024 * 1024
 
 db = SQLAlchemy(app)
 ADMIN_KEY = os.getenv("ADMIN_KEY", "change-me")
-VERSION = "0.6.5"
+VERSION = "0.7.0"
 
 
 class Link(db.Model):
@@ -428,6 +428,178 @@ def typography_similarity(a, b):
     return round(family * 0.55 + geometry * 0.45, 1)
 
 
+
+# -------------------------- SIFT / Homography Visual Fingerprint --------------------------
+
+def _resize_for_features(gray, max_side=900):
+    if gray is None:
+        return None, 1.0
+    h, w = gray.shape[:2]
+    side = max(h, w)
+    if side <= max_side:
+        return gray, 1.0
+    scale = max_side / float(side)
+    resized = cv2.resize(gray, (max(1, int(w*scale)), max(1, int(h*scale))), interpolation=cv2.INTER_AREA)
+    return resized, scale
+
+
+def sift_fingerprint(raw):
+    """
+    등록 시 1회 계산.
+    descriptors는 float32라 JSON 저장용으로 base64+npz 압축.
+    keypoint 좌표/크기/각도도 함께 저장.
+    """
+    gray = decode_gray(raw)
+    if gray is None:
+        return {}
+    gray, scale = _resize_for_features(gray, 900)
+    sift = cv2.SIFT_create(nfeatures=1400, contrastThreshold=0.025, edgeThreshold=12, sigma=1.6)
+    kps, desc = sift.detectAndCompute(gray, None)
+    if desc is None or not kps:
+        return {"count": 0, "scale": scale}
+
+    # Cap descriptors for predictable storage/latency.
+    if len(kps) > 900:
+        order = sorted(range(len(kps)), key=lambda i: kps[i].response, reverse=True)[:900]
+        kps = [kps[i] for i in order]
+        desc = desc[order]
+
+    import io
+    buf = io.BytesIO()
+    np.savez_compressed(
+        buf,
+        descriptors=desc.astype(np.float32),
+        points=np.array([[k.pt[0], k.pt[1], k.size, k.angle, k.response] for k in kps], dtype=np.float32),
+        shape=np.array(gray.shape[:2], dtype=np.int32),
+    )
+    return {
+        "count": int(len(kps)),
+        "scale": round(float(scale), 5),
+        "npz_b64": base64.b64encode(buf.getvalue()).decode("ascii"),
+    }
+
+
+def _load_sift_fingerprint(fp):
+    if not fp or not fp.get("npz_b64"):
+        return None
+    try:
+        import io
+        raw = base64.b64decode(fp["npz_b64"])
+        data = np.load(io.BytesIO(raw))
+        return {
+            "descriptors": data["descriptors"].astype(np.float32),
+            "points": data["points"].astype(np.float32),
+            "shape": tuple(int(v) for v in data["shape"]),
+        }
+    except Exception:
+        return None
+
+
+def sift_homography_score_from_fp(fp, frame_raw):
+    ref = _load_sift_fingerprint(fp)
+    frame = decode_gray(frame_raw)
+    if ref is None or frame is None:
+        return {
+            "score": 0.0, "good_matches": 0, "inliers": 0, "inlier_ratio": 0.0,
+            "median_error": None, "coverage": 0.0, "homography": False
+        }
+
+    frame, _ = _resize_for_features(frame, 900)
+    sift = cv2.SIFT_create(nfeatures=1600, contrastThreshold=0.025, edgeThreshold=12, sigma=1.6)
+    k2, d2 = sift.detectAndCompute(frame, None)
+    d1 = ref["descriptors"]
+    pts1 = ref["points"]
+    if d2 is None or len(d1) < 6 or len(k2) < 6:
+        return {
+            "score": 0.0, "good_matches": 0, "inliers": 0, "inlier_ratio": 0.0,
+            "median_error": None, "coverage": 0.0, "homography": False
+        }
+
+    matcher = cv2.BFMatcher(cv2.NORM_L2)
+    pairs = matcher.knnMatch(d1, d2, k=2)
+    good = []
+    for pair in pairs:
+        if len(pair) != 2:
+            continue
+        m, n = pair
+        if m.distance < 0.74 * n.distance:
+            good.append(m)
+
+    if len(good) < 4:
+        weak = min(24.0, len(good) * 4.0)
+        return {
+            "score": round(weak, 1), "good_matches": len(good), "inliers": 0,
+            "inlier_ratio": 0.0, "median_error": None,
+            "coverage": round(min(1.0, len(good)/24.0), 3), "homography": False
+        }
+
+    src_pts = np.float32([[pts1[m.queryIdx][0], pts1[m.queryIdx][1]] for m in good]).reshape(-1, 1, 2)
+    dst_pts = np.float32([k2[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+
+    try:
+        H, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 4.0)
+    except cv2.error:
+        H, mask = None, None
+
+    if H is None or mask is None:
+        return {
+            "score": min(32.0, len(good) * 2.0), "good_matches": len(good), "inliers": 0,
+            "inlier_ratio": 0.0, "median_error": None,
+            "coverage": round(min(1.0, len(good)/35.0), 3), "homography": False
+        }
+
+    inlier_mask = mask.ravel().astype(bool)
+    inliers = int(inlier_mask.sum())
+    inlier_ratio = inliers / max(1, len(good))
+
+    # Reprojection error on inliers.
+    projected = cv2.perspectiveTransform(src_pts, H)
+    errors = np.linalg.norm(projected.reshape(-1, 2) - dst_pts.reshape(-1, 2), axis=1)
+    inlier_errors = errors[inlier_mask] if len(errors) == len(inlier_mask) else errors
+    median_error = float(np.median(inlier_errors)) if len(inlier_errors) else 99.0
+
+    # Spatial coverage on the reference image.
+    rh, rw = ref["shape"]
+    inlier_ref = src_pts.reshape(-1,2)[inlier_mask]
+    coverage = 0.0
+    if len(inlier_ref) >= 3 and rw > 0 and rh > 0:
+        xspan = (float(inlier_ref[:,0].max()) - float(inlier_ref[:,0].min())) / rw
+        yspan = (float(inlier_ref[:,1].max()) - float(inlier_ref[:,1].min())) / rh
+        coverage = max(0.0, min(1.0, (xspan * yspan) ** 0.5))
+
+    # Score components.
+    match_strength = min(100.0, 100.0 * inliers / 45.0)
+    ratio_score = min(100.0, inlier_ratio * 100.0)
+    error_score = max(0.0, 100.0 * (1.0 - median_error / 8.0))
+    coverage_score = min(100.0, coverage * 145.0)
+
+    score = (
+        match_strength * 0.34 +
+        ratio_score * 0.32 +
+        error_score * 0.20 +
+        coverage_score * 0.14
+    )
+
+    # Strong geometric agreement deserves a floor.
+    if inliers >= 18 and inlier_ratio >= 0.70 and median_error <= 3.0:
+        score = max(score, 78.0)
+    if inliers >= 30 and inlier_ratio >= 0.80 and median_error <= 2.0:
+        score = max(score, 88.0)
+
+    return {
+        "score": round(min(100.0, score), 1),
+        "good_matches": int(len(good)),
+        "inliers": inliers,
+        "inlier_ratio": round(inlier_ratio, 3),
+        "median_error": round(median_error, 2),
+        "coverage": round(coverage, 3),
+        "homography": True,
+    }
+
+
+def sift_homography_score(ref_raw, frame_raw):
+    return sift_homography_score_from_fp(sift_fingerprint(ref_raw), frame_raw)
+
 # -------------------------- full visual / logo --------------------------
 
 def color_profile(raw):
@@ -560,25 +732,46 @@ def build_identity_profile(full_raw, major_raw, minor_raw, major, minor):
         "full_visual": {
             "color": color_profile(full_raw),
             "variants": generate_variants(full_raw),
+            "sift": sift_fingerprint(full_raw),
         },
     }
 
 
 def profile_visual_score(row, frame_raw):
-    scores = []
-    sh, orb, vs = visual_score(row.reference_image, frame_raw)
-    scores.append(("original", sh, orb, vs))
+    """
+    SIFT+Homography is primary.
+    Legacy shape/orb remains secondary for cases with too few SIFT features.
+    """
     try:
         p = json.loads(row.identity_profile or "{}")
-        for name, b64 in p.get("full_visual", {}).get("variants", {}).items():
-            if name == "original":
-                continue
-            raw = base64.b64decode(b64)
-            sh, orb, vs = visual_score(raw, frame_raw)
-            scores.append((name, sh, orb, vs))
     except Exception:
-        pass
-    return max(scores, key=lambda x: x[3]) if scores else ("none", 0.0, 0.0, 0.0)
+        p = {}
+
+    sift_fp = p.get("full_visual", {}).get("sift", {})
+    if not sift_fp:
+        sift_fp = sift_fingerprint(row.reference_image)
+
+    sift_diag = sift_homography_score_from_fp(sift_fp, frame_raw)
+    sift_score = float(sift_diag.get("score", 0.0))
+
+    # Legacy score only as support; never allowed to suppress a strong homography.
+    sh, orb, legacy = visual_score(row.reference_image, frame_raw)
+
+    if sift_diag.get("homography") and sift_diag.get("inliers", 0) >= 8:
+        final = max(sift_score, sift_score * 0.88 + legacy * 0.12)
+        method = "SIFT_HOMOGRAPHY"
+    else:
+        final = max(sift_score * 0.60 + legacy * 0.40, legacy * 0.75)
+        method = "SIFT_FALLBACK"
+
+    diag = {
+        **sift_diag,
+        "legacy_shape": sh,
+        "legacy_orb": orb,
+        "legacy_visual": legacy,
+        "method": method,
+    }
+    return round(min(100.0, final), 1), diag
 
 
 # -------------------------- candidate / verification --------------------------
@@ -645,7 +838,7 @@ INDEX_HTML = r"""<!doctype html>
 <html lang="ko">
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>LUPER Registry V0.6.5</title>
+<title>LUPER Registry V0.7.0</title>
 <style>
 body{font-family:system-ui,-apple-system,sans-serif;background:#f5f6f8;color:#17191c;margin:0}
 .w{max-width:1220px;margin:22px auto;padding:0 15px}.c{background:#fff;border:1px solid #ddd;border-radius:14px;padding:18px;margin:13px 0}
@@ -659,8 +852,8 @@ table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:8px;borde
 @media(max-width:820px){.g,.g3{grid-template-columns:1fr}.full{grid-column:auto}table{display:block;overflow:auto}}
 </style></head>
 <body><div class="w">
-<h2>LUPER LIVE Registry V0.6.5</h2>
-<p><b>문자 → 후보 → 대/소분류 Typography → Visual/Logo → GPS → 5초 링크카드</b></p>
+<h2>LUPER LIVE Registry V0.7.0</h2>
+<p><b>문자 → 후보 → Typography → SIFT+Homography Visual ID 확정 → GPS → 5초 링크카드</b></p>
 
 <div class="c">
 <label>관리자 키</label><div class="row"><input id="admin" type="password"><button id="saveKey">키 저장</button></div>
@@ -866,7 +1059,7 @@ def verify():
 
         best_major = (0.0, "", None)
         best_minor = (0.0, "", None)
-        best_visual = (0.0, "", 0.0, 0.0, 0.0)
+        best_visual = (0.0, {})
         frame_visuals = {}
 
         # Typography compares only candidate-relevant crops.
@@ -884,12 +1077,12 @@ def verify():
                     if typ > best_minor[0]:
                         best_minor = (typ, txt, raw)
 
-            variant, sh, orb, vs = profile_visual_score(row, raw)
+            vs, vdiag = profile_visual_score(row, raw)
             if vs > best_visual[0]:
-                best_visual = (vs, variant, sh, orb, vs)
+                best_visual = (vs, vdiag)
             prev = frame_visuals.get(frame_index)
             if prev is None or vs > prev[0]:
-                frame_visuals[frame_index] = (vs, variant, sh, orb)
+                frame_visuals[frame_index] = (vs, vdiag)
 
         # Full registration mode controls visual weight / floor.
         mode = row.match_mode or profile.get("mode") or "TEXT_TYPOGRAPHY"
@@ -910,16 +1103,16 @@ def verify():
 
         if mode == "LOGO_ONLY":
             weights = (0.00, 0.00, 1.00)
-            visual_floor = max(62.0, row.visual_threshold)
+            visual_floor = max(68.0, row.visual_threshold)
         elif mode == "WORDMARK_OR_TEXT":
             weights = (0.55, 0.20, 0.25)
-            visual_floor = max(38.0, row.visual_threshold - 8)
+            visual_floor = max(48.0, row.visual_threshold - 4)
         elif mode == "TEXT_LOGO":
             weights = (0.58, 0.22, 0.20)
-            visual_floor = max(30.0, row.visual_threshold - 14)
+            visual_floor = max(42.0, row.visual_threshold - 6)
         else:  # TEXT_TYPOGRAPHY
             weights = (0.62, 0.28, 0.10)
-            visual_floor = max(24.0, row.visual_threshold - 18)
+            visual_floor = max(36.0, row.visual_threshold - 10)
 
         typo_score = major_typ * 0.70 + minor_typ * 0.30
         final_conf = text_score * weights[0] + typo_score * weights[1] + visual * weights[2]
@@ -927,7 +1120,7 @@ def verify():
         # Strong text + typography is allowed to survive a low logo/full-image score.
         visual_ok = visual >= visual_floor
         if mode != "LOGO_ONLY" and text_score >= 84 and typo_score >= 58:
-            visual_ok = visual >= max(18.0, visual_floor - 12)
+            visual_ok = visual >= max(30.0, visual_floor - 10)
 
         gok, dist = gps_ok(row, lat, lon)
         passed = bool(tc["eligible"] and visual_ok and gok and final_conf >= (58 if mode != "LOGO_ONLY" else 66))
@@ -948,7 +1141,14 @@ def verify():
             "typography_score": round(typo_score, 1),
             "visual_score": round(visual, 1),
             "visual_floor": round(visual_floor, 1),
-            "best_visual_variant": best_visual[1],
+            "visual_method": best_visual[1].get("method", "none") if len(best_visual) > 1 else "none",
+            "sift_good_matches": best_visual[1].get("good_matches", 0) if len(best_visual) > 1 else 0,
+            "sift_inliers": best_visual[1].get("inliers", 0) if len(best_visual) > 1 else 0,
+            "sift_inlier_ratio": best_visual[1].get("inlier_ratio", 0) if len(best_visual) > 1 else 0,
+            "sift_median_error": best_visual[1].get("median_error") if len(best_visual) > 1 else None,
+            "sift_coverage": best_visual[1].get("coverage", 0) if len(best_visual) > 1 else 0,
+            "legacy_shape": best_visual[1].get("legacy_shape", 0) if len(best_visual) > 1 else 0,
+            "legacy_orb": best_visual[1].get("legacy_orb", 0) if len(best_visual) > 1 else 0,
             "visual_frames": len(frame_visuals),
             "final_confidence": round(final_conf, 1),
             "gps_ok": gok,
@@ -1030,7 +1230,15 @@ def migrate():
         if row.recognition_text != desired:
             row.recognition_text = desired
             changed = True
-        if not row.identity_profile:
+        try:
+            current = json.loads(row.identity_profile or "{}")
+        except Exception:
+            current = {}
+        needs_rebuild = (
+            not current or
+            not current.get("full_visual", {}).get("sift", {}).get("npz_b64")
+        )
+        if needs_rebuild:
             try:
                 p = build_identity_profile(
                     row.reference_image,
