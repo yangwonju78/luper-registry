@@ -26,7 +26,7 @@ app.config["MAX_CONTENT_LENGTH"] = 15 * 1024 * 1024
 
 db = SQLAlchemy(app)
 ADMIN_KEY = os.getenv("ADMIN_KEY", "change-me")
-VERSION = "0.7.0"
+VERSION = "0.7.1"
 
 
 class Link(db.Model):
@@ -838,7 +838,7 @@ INDEX_HTML = r"""<!doctype html>
 <html lang="ko">
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>LUPER Registry V0.7.0</title>
+<title>LUPER Registry V0.7.1</title>
 <style>
 body{font-family:system-ui,-apple-system,sans-serif;background:#f5f6f8;color:#17191c;margin:0}
 .w{max-width:1220px;margin:22px auto;padding:0 15px}.c{background:#fff;border:1px solid #ddd;border-radius:14px;padding:18px;margin:13px 0}
@@ -852,7 +852,7 @@ table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:8px;borde
 @media(max-width:820px){.g,.g3{grid-template-columns:1fr}.full{grid-column:auto}table{display:block;overflow:auto}}
 </style></head>
 <body><div class="w">
-<h2>LUPER LIVE Registry V0.7.0</h2>
+<h2>LUPER LIVE Registry V0.7.1</h2>
 <p><b>문자 → 후보 → Typography → SIFT+Homography Visual ID 확정 → GPS → 5초 링크카드</b></p>
 
 <div class="c">
@@ -1120,7 +1120,15 @@ def verify():
         # Strong text + typography is allowed to survive a low logo/full-image score.
         visual_ok = visual >= visual_floor
         if mode != "LOGO_ONLY" and text_score >= 84 and typo_score >= 58:
-            visual_ok = visual >= max(30.0, visual_floor - 10)
+            strong_sift = (
+            best_visual[1].get("method") == "SIFT_HOMOGRAPHY"
+            and best_visual[1].get("score", 0) >= 90.0
+            and best_visual[1].get("inliers", 0) >= 20
+            and best_visual[1].get("inlier_ratio", 0) >= 0.70
+        )
+        visual_ok = visual >= max(30.0, visual_floor - 10)
+        if strong_sift:
+            visual_ok = True
 
         gok, dist = gps_ok(row, lat, lon)
         passed = bool(tc["eligible"] and visual_ok and gok and final_conf >= (58 if mode != "LOGO_ONLY" else 66))
@@ -1150,6 +1158,8 @@ def verify():
             "legacy_shape": best_visual[1].get("legacy_shape", 0) if len(best_visual) > 1 else 0,
             "legacy_orb": best_visual[1].get("legacy_orb", 0) if len(best_visual) > 1 else 0,
             "visual_frames": len(frame_visuals),
+            "strong_sift": strong_sift,
+            "fast_path": fast_path,
             "final_confidence": round(final_conf, 1),
             "gps_ok": gok,
             "distance_m": dist,
