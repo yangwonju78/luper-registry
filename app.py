@@ -1,174 +1,966 @@
-import base64, difflib, math, os, re
+import base64
+import difflib
+import json
+import math
+import os
+import re
 from datetime import datetime, timezone
-import cv2, numpy as np
-from flask import Flask, jsonify, request, Response
+
+import cv2
+import numpy as np
+from flask import Flask, Response, jsonify, request
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import inspect, text as sql_text
-app=Flask(__name__)
-db_url=os.getenv("DATABASE_URL","sqlite:///registry.db")
-if db_url.startswith("postgres://"): db_url="postgresql+psycopg://"+db_url[len("postgres://"):]
-elif db_url.startswith("postgresql://") and "+psycopg" not in db_url: db_url="postgresql+psycopg://"+db_url[len("postgresql://"):]
-app.config["SQLALCHEMY_DATABASE_URI"]=db_url
-app.config["SQLALCHEMY_TRACK_MODIFICATIONS"]=False
-app.config["MAX_CONTENT_LENGTH"]=10*1024*1024
-db=SQLAlchemy(app);ADMIN_KEY=os.getenv("ADMIN_KEY","change-me");VERSION="0.5.0"
+
+app = Flask(__name__)
+
+db_url = os.getenv("DATABASE_URL", "sqlite:///registry.db")
+if db_url.startswith("postgres://"):
+    db_url = "postgresql+psycopg://" + db_url[len("postgres://"):]
+elif db_url.startswith("postgresql://") and "+psycopg" not in db_url:
+    db_url = "postgresql+psycopg://" + db_url[len("postgresql://"):]
+
+app.config["SQLALCHEMY_DATABASE_URI"] = db_url
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+app.config["MAX_CONTENT_LENGTH"] = 15 * 1024 * 1024
+
+db = SQLAlchemy(app)
+ADMIN_KEY = os.getenv("ADMIN_KEY", "change-me")
+VERSION = "0.6.0"
+
+
 class Link(db.Model):
- __tablename__="links"
- id=db.Column(db.Integer,primary_key=True);key_text=db.Column(db.String(300),nullable=False,default="");registration_name=db.Column(db.String(300));major_category=db.Column(db.String(300));minor_category=db.Column(db.String(500));recognition_text=db.Column(db.String(1000));display_name=db.Column(db.String(300),nullable=False);url=db.Column(db.Text,nullable=False);use_location=db.Column(db.Boolean,nullable=False,default=False);latitude=db.Column(db.Float);longitude=db.Column(db.Float);radius_m=db.Column(db.Float,nullable=False,default=150.0);priority=db.Column(db.Integer,nullable=False,default=0);enabled=db.Column(db.Boolean,nullable=False,default=True);visual_threshold=db.Column(db.Float,nullable=False,default=55.0);reference_image=db.Column(db.LargeBinary,nullable=False);created_at=db.Column(db.DateTime(timezone=True),nullable=False,default=lambda:datetime.now(timezone.utc))
- def normalized_fields(self):
-  major=(self.major_category or self.key_text or "").strip();return {"registration_name":(self.registration_name or self.display_name or major).strip(),"major_category":major,"minor_category":(self.minor_category or "").strip(),"recognition_text":(self.recognition_text or self.key_text or major).strip(),"display_name":(self.display_name or major).strip()}
- def public_dict(self):
-  f=self.normalized_fields();return {"id":self.id,**f,"key_text":self.key_text,"url":self.url,"use_location":bool(self.use_location),"latitude":self.latitude,"longitude":self.longitude,"radius_m":self.radius_m,"priority":self.priority,"enabled":bool(self.enabled),"visual_threshold":self.visual_threshold,"reference_image":True,"created_at":self.created_at.isoformat() if self.created_at else None}
-def norm(s): return "".join(ch.lower() for ch in (s or "") if ch.isalnum())
-def sim(a,b):
- a,b=norm(a),norm(b)
- if not a or not b:return 0.0
- if a==b:return 100.0
- if a in b or b in a:return 88.0+12.0*min(len(a),len(b))/max(len(a),len(b))
- return 100.0*difflib.SequenceMatcher(None,a,b).ratio()
-def tokens(s): return [t for t in re.split(r"[\s,|/·]+",s or "") if norm(t)]
-def token_best(ocr,field):
- ts=tokens(field);return max([sim(ocr,t) for t in ts],default=0.0)
-def text_score(ocr,row):
- f=row.normalized_fields();major=sim(ocr,f["major_category"]);minor=max(sim(ocr,f["minor_category"]),token_best(ocr,f["minor_category"]));recog=max(sim(ocr,f["recognition_text"]),token_best(ocr,f["recognition_text"]));labels=max(sim(ocr,f["display_name"]),sim(ocr,f["registration_name"]));weighted=major*.45+minor*.25+recog*.20+labels*.10
- if norm(f["major_category"]) and (norm(f["major_category"]) in norm(ocr) or norm(ocr) in norm(f["major_category"])): weighted=max(weighted,82.0)
- return round(min(100.0,weighted),1),{"major":round(major,1),"minor":round(minor,1),"recognition":round(recog,1),"labels":round(labels,1)}
-def hav(a,b,c,d):
- r=6371000.;p1,p2=math.radians(a),math.radians(c);dp=math.radians(c-a);dl=math.radians(d-b);x=math.sin(dp/2)**2+math.cos(p1)*math.cos(p2)*math.sin(dl/2)**2;return 2*r*math.asin(math.sqrt(x))
+    __tablename__ = "links"
+
+    id = db.Column(db.Integer, primary_key=True)
+    key_text = db.Column(db.String(300), nullable=False, default="")
+    registration_name = db.Column(db.String(300))
+    major_category = db.Column(db.String(300))
+    minor_category = db.Column(db.String(500))
+    recognition_text = db.Column(db.String(1500))
+    display_name = db.Column(db.String(300), nullable=False)
+    url = db.Column(db.Text, nullable=False)
+
+    match_mode = db.Column(db.String(30), nullable=False, default="auto")
+    use_location = db.Column(db.Boolean, nullable=False, default=False)
+    latitude = db.Column(db.Float)
+    longitude = db.Column(db.Float)
+    radius_m = db.Column(db.Float, nullable=False, default=150.0)
+    priority = db.Column(db.Integer, nullable=False, default=0)
+    enabled = db.Column(db.Boolean, nullable=False, default=True)
+
+    reference_image = db.Column(db.LargeBinary, nullable=False)
+    major_reference = db.Column(db.LargeBinary)
+    minor_reference = db.Column(db.LargeBinary)
+
+    visual_threshold = db.Column(db.Float, nullable=False, default=48.0)
+    identity_profile = db.Column(db.Text)
+    created_at = db.Column(
+        db.DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+    def fields(self):
+        major = (self.major_category or self.key_text or "").strip()
+        minor = (self.minor_category or "").strip()
+        return {
+            "registration_name": (self.registration_name or self.display_name or major).strip(),
+            "major_category": major,
+            "minor_category": minor,
+            "recognition_text": (self.recognition_text or build_recognition_text(major, minor)).strip(),
+            "display_name": (self.display_name or major).strip(),
+        }
+
+    def public_dict(self):
+        f = self.fields()
+        try:
+            profile = json.loads(self.identity_profile or "{}")
+        except Exception:
+            profile = {}
+        return {
+            "id": self.id,
+            **f,
+            "url": self.url,
+            "match_mode": self.match_mode or "auto",
+            "use_location": bool(self.use_location),
+            "latitude": self.latitude,
+            "longitude": self.longitude,
+            "radius_m": self.radius_m,
+            "priority": self.priority,
+            "enabled": bool(self.enabled),
+            "visual_threshold": self.visual_threshold,
+            "profile_summary": {
+                "mode": profile.get("mode"),
+                "major_typography": profile.get("major_typography", {}).get("font_family_probabilities", {}),
+                "minor_typography": profile.get("minor_typography", {}).get("font_family_probabilities", {}),
+                "color": profile.get("full_visual", {}).get("color", {}),
+            },
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+# -------------------------- text / hangul --------------------------
+
+def norm(s):
+    return "".join(ch.lower() for ch in (s or "") if ch.isalnum())
+
+
+def split_terms(s):
+    return [x for x in re.split(r"[\s,|/·]+", s or "") if norm(x)]
+
+
+def build_recognition_terms(major, minor):
+    major = (major or "").strip()
+    minors = split_terms(minor)
+    terms = []
+    if major:
+        terms.append(major)
+    terms.extend(minors)
+    for m in minors:
+        if major:
+            terms.append(f"{major} {m}")
+            terms.append(f"{major}{m}")
+    if major and minor:
+        terms.append(f"{major} {minor}".strip())
+        terms.append(f"{major}{minor}".replace(" ", ""))
+    # unique preserving order
+    return list(dict.fromkeys(t for t in terms if t))
+
+
+def build_recognition_text(major, minor):
+    return " | ".join(build_recognition_terms(major, minor))
+
+
+CHO = "ㄱㄲㄴㄷㄸㄹㅁㅂㅃㅅㅆㅇㅈㅉㅊㅋㅌㅍㅎ"
+JUNG = "ㅏㅐㅑㅒㅓㅔㅕㅖㅗㅘㅙㅚㅛㅜㅝㅞㅟㅠㅡㅢㅣ"
+JONG = ["", "ㄱ", "ㄲ", "ㄳ", "ㄴ", "ㄵ", "ㄶ", "ㄷ", "ㄹ", "ㄺ", "ㄻ", "ㄼ", "ㄽ", "ㄾ", "ㄿ", "ㅀ", "ㅁ", "ㅂ", "ㅄ", "ㅅ", "ㅆ", "ㅇ", "ㅈ", "ㅊ", "ㅋ", "ㅌ", "ㅍ", "ㅎ"]
+
+
+def decompose_hangul(s):
+    out = []
+    for ch in norm(s):
+        code = ord(ch)
+        if 0xAC00 <= code <= 0xD7A3:
+            v = code - 0xAC00
+            out.extend([CHO[v // 588], JUNG[(v % 588) // 28]])
+            jong = JONG[v % 28]
+            if jong:
+                out.append(jong)
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def sequence_ratio(a, b):
+    a, b = norm(a), norm(b)
+    if not a or not b:
+        return 0.0
+    if a == b:
+        return 100.0
+    return 100.0 * difflib.SequenceMatcher(None, a, b).ratio()
+
+
+def hangul_similarity(a, b):
+    raw = sequence_ratio(a, b)
+    ja = decompose_hangul(a)
+    jb = decompose_hangul(b)
+    jamo = 100.0 * difflib.SequenceMatcher(None, ja, jb).ratio() if ja and jb else raw
+    # OCR "족발→측발" 같은 한두 자 오독을 살리기 위해 자모 비교를 더 신뢰.
+    return round(max(raw, raw * 0.35 + jamo * 0.65), 1)
+
+
+def best_term_score(ocr, target):
+    if not target:
+        return 0.0
+    scores = [hangul_similarity(ocr, target)]
+    scores.extend(hangul_similarity(ocr, t) for t in split_terms(target))
+    return max(scores, default=0.0)
+
+
+# -------------------------- image helpers --------------------------
+
 def b64_bytes(data):
- if not data:return None
- raw=data.split(",",1)[1] if "," in data else data
- try:return base64.b64decode(raw,validate=False)
- except:return None
-def decode_gray(raw): return cv2.imdecode(np.frombuffer(raw,np.uint8),cv2.IMREAD_GRAYSCALE) if raw else None
-def prep(gray):
- if gray is None:return None
- blur=cv2.GaussianBlur(gray,(3,3),0);_,bw=cv2.threshold(blur,0,255,cv2.THRESH_BINARY_INV+cv2.THRESH_OTSU);pts=cv2.findNonZero(bw)
- if pts is not None:
-  x,y,w,h=cv2.boundingRect(pts);px=max(4,int(w*.08));py=max(4,int(h*.12));bw=bw[max(0,y-py):min(gray.shape[0],y+h+py),max(0,x-px):min(gray.shape[1],x+w+px)]
- return bw if bw is not None and bw.size else None
-def shape_score(ref,frame):
- a,b=prep(ref),prep(frame)
- if a is None or b is None:return 0.0
- W,H=640,240
- def fit(src):
-  h,w=src.shape[:2];scale=min(W/max(1,w),H/max(1,h));nw,nh=max(1,int(w*scale)),max(1,int(h*scale));r=cv2.resize(src,(nw,nh),interpolation=cv2.INTER_AREA);c=np.zeros((H,W),np.uint8);x=(W-nw)//2;y=(H-nh)//2;c[y:y+nh,x:x+nw]=r;return c
- aa,bb=fit(a),fit(b);corr=max(0.0,float(cv2.matchTemplate(aa,bb,cv2.TM_CCOEFF_NORMED)[0][0]));ea,eb=cv2.Canny(aa,50,140),cv2.Canny(bb,50,140);inter=np.logical_and(ea>0,eb>0).sum();union=np.logical_or(ea>0,eb>0).sum();iou=float(inter/union) if union else 0.0;return min(100.,100*(.78*corr+.22*iou))
-def orb_score(ref,frame):
- orb=cv2.ORB_create(nfeatures=1800,fastThreshold=6);k1,d1=orb.detectAndCompute(ref,None);k2,d2=orb.detectAndCompute(frame,None)
- if d1 is None or d2 is None or len(k1)<6 or len(k2)<6:return 0.0
- pairs=cv2.BFMatcher(cv2.NORM_HAMMING).knnMatch(d1,d2,k=2);good=[m for pair in pairs if len(pair)==2 for m,n in [pair] if m.distance<.74*n.distance]
- if len(good)<4:return min(30.,len(good)*6.)
- coverage=min(1.,len(good)/max(14.,min(len(k1),45.)));inlier=0.
- if len(good)>=6:
-  src=np.float32([k1[m.queryIdx].pt for m in good]).reshape(-1,1,2);dst=np.float32([k2[m.trainIdx].pt for m in good]).reshape(-1,1,2)
-  try:
-   _,mask=cv2.findHomography(src,dst,cv2.RANSAC,5.0);inlier=float(mask.sum())/len(mask) if mask is not None and len(mask) else 0.
-  except cv2.error:pass
- return min(100.,100*(.56*coverage+.44*inlier))
-def visual_components(rb,fb):
- ref,frame=decode_gray(rb),decode_gray(fb)
- if ref is None or frame is None:return 0.,0.,0.
- sh=shape_score(ref,frame);orb=orb_score(ref,frame);final=max(sh,.58*sh+.42*orb);return round(sh,1),round(orb,1),round(min(100.,final),1)
+    if not data:
+        return None
+    raw = data.split(",", 1)[1] if "," in data else data
+    try:
+        return base64.b64decode(raw, validate=False)
+    except Exception:
+        return None
 
-def build_identity_profile(raw,major,minor):
- gray=decode_gray(raw); geom={}; color={"family":"unknown"}; variants={}
- if gray is None:return {}
- bw=prep(gray)
- if bw is not None:
-  h,w=bw.shape[:2];ink=(bw>0).astype(np.uint8);n,lab,stats,cent=cv2.connectedComponentsWithStats(ink,8)
-  comps=[tuple(int(v) for v in stats[i]) for i in range(1,n) if int(stats[i][4])>=max(12,int(w*h*.0008))]
-  comps.sort(key=lambda q:q[0]);mh=float(np.median([c[3] for c in comps])) if comps else float(h)
-  gaps=[max(0,b[0]-(a[0]+a[2]))/max(1.0,mh) for a,b in zip(comps,comps[1:])]
-  dist=cv2.distanceTransform(ink,cv2.DIST_L2,5);pos=dist[dist>0]
-  geom={"aspect_ratio":round(w/max(1.0,h),3),"component_count":len(comps),"median_gap_ratio":round(float(np.median(gaps)) if gaps else 0,3),"stroke_to_height_ratio":round((2*float(np.median(pos))/max(1.0,mh)) if len(pos) else 0,3)}
- img=cv2.imdecode(np.frombuffer(raw,np.uint8),cv2.IMREAD_COLOR)
- if img is not None:
-  hsv=cv2.cvtColor(cv2.resize(img,(96,96)),cv2.COLOR_BGR2HSV);vals=hsv[hsv[:,:,1]>35]
-  if len(vals):
-   h=float(np.mean(vals,axis=0)[0]);fam="red" if h<10 or h>=170 else "orange" if h<25 else "yellow" if h<40 else "green" if h<85 else "blue" if h<130 else "purple"
-   color={"family":fam}
- vv={"original":gray,"contrast":cv2.convertScaleAbs(gray,alpha=1.45,beta=-18),"blur":cv2.GaussianBlur(gray,(5,5),0),"threshold":cv2.threshold(gray,0,255,cv2.THRESH_BINARY+cv2.THRESH_OTSU)[1]}
- for name,v in vv.items():
-  ok,enc=cv2.imencode(".jpg",v,[int(cv2.IMWRITE_JPEG_QUALITY),78])
-  if ok:variants[name]=base64.b64encode(enc.tobytes()).decode("ascii")
- return {"profile_version":"1.0","auto_recognition_terms":[x for x in [major,minor,(major+" "+minor).strip()] if x],"geometry":geom,"color":color,"variants":variants}
 
-def profile_visual_score(row,frame):
- scores=[];a,b,c=visual_components(row.reference_image,frame);scores.append(("original",a,b,c))
- try:
-  p=json.loads(row.identity_profile or "{}")
-  for name,b64 in (p.get("variants") or {}).items():
-   if name!="original":
-    a,b,c=visual_components(base64.b64decode(b64),frame);scores.append((name,a,b,c))
- except:pass
- return max(scores,key=lambda q:q[3]) if scores else ("none",0,0,0)
+def decode_color(raw):
+    if not raw:
+        return None
+    return cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)
 
-def require_admin(): return bool(ADMIN_KEY) and request.headers.get("X-Admin-Key","")==ADMIN_KEY
-INDEX_HTML='<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>LUPER Registry V0.5.0</title><style>\nbody{font-family:system-ui,-apple-system,sans-serif;margin:0;background:#f5f6f8;color:#17191c}.w{max-width:1180px;margin:24px auto;padding:0 16px}.c{background:#fff;border:1px solid #ddd;border-radius:14px;padding:18px;margin:14px 0}.g{display:grid;grid-template-columns:1fr 1fr;gap:12px}.g3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px}label{display:block;font-size:13px;color:#555;margin:0 0 5px}input,select{width:100%;box-sizing:border-box;padding:10px;border:1px solid #cfd4da;border-radius:8px;font-size:14px}.full{grid-column:1/-1}.row{display:flex;gap:8px;align-items:center}.row input[type=checkbox]{width:auto}button{padding:10px 13px;border:0;border-radius:8px;background:#111;color:#fff;font-weight:700;cursor:pointer}.muted{color:#666;font-size:13px}.warn{color:#a33;font-weight:700}.ok{color:#176b36;font-weight:700}table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:8px;border-bottom:1px solid #eee;text-align:left;vertical-align:top}a{color:#1558d6}.diag{white-space:pre-wrap;background:#111;color:#eee;padding:12px;border-radius:8px;font:12px/1.5 ui-monospace,monospace}@media(max-width:800px){.g,.g3{grid-template-columns:1fr}.full{grid-column:auto}table{display:block;overflow:auto}}\n</style></head><body><div class="w"><h2>LUPER Visual Link Registry V0.5.0</h2><p><b>TEXT 선별 → 상위 후보만 VISUAL 검증 → GPS → 5초 링크카드</b></p>\n<div class="c"><label>관리자 키</label><div class="row"><input id="admin" type="password" placeholder="Render ADMIN_KEY" style="flex:1"><button type="button" id="saveKey">키 저장</button></div><p class="muted">브라우저 탭의 sessionStorage에만 저장됩니다.</p></div>\n<div class="c"><form id="f"><div class="g"><div><label>등록명 (관리자용 고유 이름)</label><input id="regname" required placeholder="살만온족발_메뉴_01"></div><div><label>표시명 (카드에 표시)</label><input id="display" required placeholder="살만온족발 메뉴"></div><div><label>대분류 · 상호/브랜드</label><input id="major" required placeholder="살만온족발"></div><div><label>소분류 · 서비스/콘텐츠</label><input id="minor" placeholder="족발 보쌈 닭발"></div><div class="full"><label>인식문자 · 자동생성</label><input id="recognition" disabled placeholder="대분류 + 소분류에서 자동 생성"></div><div class="full"><label>URL</label><input id="url" required placeholder="https://..."></div><div class="full"><label>실제 글자/간판 기준 이미지 (필수)</label><input id="img" type="file" accept="image/*" required></div><div><label>Visual 최소점수</label><input id="thr" type="number" min="0" max="100" value="55"></div><div><label>우선순위</label><input id="pri" type="number" value="0"></div><div class="full row"><input id="use" type="checkbox"><label for="use" style="margin:0">GPS 조건 사용</label></div><div><label>위도</label><input id="lat" type="number" step="any"></div><div><label>경도</label><input id="lon" type="number" step="any"></div><div><label>반경(m)</label><input id="rad" type="number" value="150"></div><div class="full"><button>등록</button></div></div></form></div>\n<div class="c"><h3>Visual 진단</h3><p class="muted">등록 원본과 실제 촬영 이미지의 Shape / ORB / Final Visual을 분리해서 확인합니다.</p><div class="g3"><div><label>등록항목</label><select id="diagEntry"></select></div><div><label>비교 이미지</label><input id="diagImg" type="file" accept="image/*"></div><div style="align-self:end"><button id="diagBtn" type="button">Visual 진단</button></div></div><div id="diagResult" class="diag" style="margin-top:12px">진단 대기</div></div>\n<div class="c"><div id="state" class="muted">서버 확인 중…</div><div id="list"></div></div><div class="c muted">TEXT 가중치: 대분류 45% · 소분류 25% · 인식문자 20% · 표시/등록명 10%. TEXT 상위 3개 후보만 Visual 비교합니다.</div></div>\n<script>\nconst $=id=>document.getElementById(id);const esc=s=>String(s??\'\').replace(/[&<>"]/g,c=>({\'&\':\'&amp;\',\'<\':\'&lt;\',\'>\':\'&gt;\',\'"\':\'&quot;\'}[c]));$(\'admin\').value=sessionStorage.getItem(\'luper_admin_key\')||\'\';$(\'saveKey\').onclick=()=>{sessionStorage.setItem(\'luper_admin_key\',$(\'admin\').value);refresh();};const ah=()=>({\'X-Admin-Key\':$(\'admin\').value});function file64(f){return new Promise((ok,no)=>{let r=new FileReader();r.onload=()=>ok(r.result);r.onerror=no;r.readAsDataURL(f)})}\nasync function refresh(){try{const hs=await (await fetch(\'/health\')).json();$(\'state\').innerHTML=`<span class="ok">ONLINE</span> · V${esc(hs.version)} · DB ${esc(hs.database)} · entries ${hs.entries}`;const r=await fetch(\'/api/entries\',{headers:ah()});if(r.status===401){$(\'list\').innerHTML=\'<p class="warn">관리자 키를 저장하면 등록목록이 보입니다.</p>\';return}const a=await r.json();$(\'diagEntry\').innerHTML=a.map(x=>`<option value="${x.id}">${esc(x.registration_name)} · ${esc(x.display_name)}</option>`).join(\'\');let h=\'<table><tr><th>등록명</th><th>대분류</th><th>소분류</th><th>인식문자</th><th>표시명</th><th>URL</th><th>Visual</th><th>GPS</th><th></th></tr>\';for(const x of a){h+=`<tr><td><b>${esc(x.registration_name)}</b></td><td>${esc(x.major_category)}</td><td>${esc(x.minor_category)}</td><td>${esc(x.recognition_text)}</td><td>${esc(x.display_name)}</td><td style="max-width:250px;word-break:break-all"><a href="${esc(x.url)}" target="_blank">${esc(x.url)}</a></td><td>${x.visual_threshold}%</td><td>${x.use_location?x.radius_m+\'m\':\'무관\'}</td><td><button onclick="delx(${x.id})">삭제</button></td></tr>`}$(\'list\').innerHTML=h+\'</table>\'}catch(e){$(\'state\').innerHTML=\'<span class="warn">서버 연결 실패</span>\'}}\nasync function delx(id){if(!confirm(\'삭제할까요?\'))return;const r=await fetch(\'/api/entries/\'+id,{method:\'DELETE\',headers:ah()});if(!r.ok){alert(await r.text());return}refresh()}\n$(\'f\').onsubmit=async e=>{e.preventDefault();if(!$(\'admin\').value){alert(\'관리자 키를 먼저 저장하세요.\');return}const image=await file64($(\'img\').files[0]);const o={registration_name:$(\'regname\').value,display_name:$(\'display\').value,major_category:$(\'major\').value,minor_category:$(\'minor\').value,recognition_text:\'\',url:$(\'url\').value,reference_image_base64:image,visual_threshold:+$(\'thr\').value||55,priority:+$(\'pri\').value||0,use_location:$(\'use\').checked,latitude:$(\'lat\').value?+$(\'lat\').value:null,longitude:$(\'lon\').value?+$(\'lon\').value:null,radius_m:+$(\'rad\').value||150};const r=await fetch(\'/api/entries\',{method:\'POST\',headers:{\'Content-Type\':\'application/json\',\'X-Admin-Key\':$(\'admin\').value},body:JSON.stringify(o)});if(!r.ok){alert(await r.text());return}$(\'f\').reset();$(\'thr\').value=55;$(\'rad\').value=150;$(\'pri\').value=0;refresh()};\n$(\'diagBtn\').onclick=async()=>{if(!$(\'diagImg\').files[0]){alert(\'비교 이미지를 선택하세요.\');return}const image=await file64($(\'diagImg\').files[0]);$(\'diagResult\').textContent=\'진단 중...\';const r=await fetch(\'/api/visual_diagnostic\',{method:\'POST\',headers:{\'Content-Type\':\'application/json\',\'X-Admin-Key\':$(\'admin\').value},body:JSON.stringify({entry_id:+$(\'diagEntry\').value,test_image_base64:image})});const x=await r.json();if(!r.ok){$(\'diagResult\').textContent=JSON.stringify(x,null,2);return}$(\'diagResult\').textContent=`등록명: ${x.registration_name}\nShape: ${x.shape_score}%\nORB: ${x.orb_score}%\nFinal Visual: ${x.visual_score}%\n현재 기준: ${x.visual_threshold}%\n판정: ${x.visual_score>=x.visual_threshold?\'PASS\':\'FAIL\'}\n\n원본↔원본이 90% 미만이면 알고리즘/기준이미지 문제\n스크린샷은 높고 폰 촬영만 낮으면 원근·반사·Crop 영향`};refresh();\n</script></body></html>'
+
+def decode_gray(raw):
+    if not raw:
+        return None
+    return cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_GRAYSCALE)
+
+
+def trim_ink(gray):
+    if gray is None or gray.size == 0:
+        return None
+    blur = cv2.GaussianBlur(gray, (3, 3), 0)
+    _, bw = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    pts = cv2.findNonZero(bw)
+    if pts is None:
+        return bw
+    x, y, w, h = cv2.boundingRect(pts)
+    px = max(4, int(w * 0.06))
+    py = max(4, int(h * 0.10))
+    return bw[max(0, y - py): min(bw.shape[0], y + h + py),
+              max(0, x - px): min(bw.shape[1], x + w + px)]
+
+
+def image_to_jpeg_bytes(img, quality=82):
+    ok, enc = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+    return enc.tobytes() if ok else None
+
+
+def detect_text_bands(raw):
+    """
+    원본 한 장만 올렸을 때 대분류/소분류 후보 영역을 자동 분리.
+    가장 큰/상단 텍스트 밴드를 대분류, 그 다음 유효 밴드를 소분류로 사용.
+    완벽한 OCR 분할이 아니라 Typography profile 생성을 위한 자동 초기값.
+    """
+    gray = decode_gray(raw)
+    if gray is None:
+        return None, None
+    bw = trim_ink(gray)
+    if bw is None:
+        return None, None
+    # 다시 원본 좌표에서 행 밀도를 사용하기 쉽게 전체 gray 기준 binary.
+    _, full = cv2.threshold(cv2.GaussianBlur(gray, (3, 3), 0), 0, 255,
+                            cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    density = np.mean(full > 0, axis=1)
+    active = density > max(0.012, float(np.percentile(density, 62)) * 0.30)
+
+    bands = []
+    start = None
+    for i, on in enumerate(active):
+        if on and start is None:
+            start = i
+        if (not on or i == len(active)-1) and start is not None:
+            end = i if not on else i + 1
+            if end - start >= max(8, int(gray.shape[0] * 0.035)):
+                bands.append((start, end))
+            start = None
+
+    if not bands:
+        return raw, None
+
+    # merge close bands
+    merged = []
+    for y1, y2 in bands:
+        if merged and y1 - merged[-1][1] < max(5, int(gray.shape[0] * 0.025)):
+            merged[-1] = (merged[-1][0], y2)
+        else:
+            merged.append((y1, y2))
+
+    candidates = []
+    for y1, y2 in merged:
+        crop = gray[max(0, y1-4):min(gray.shape[0], y2+4), :]
+        t = trim_ink(crop)
+        if t is None or t.size == 0:
+            continue
+        h, w = t.shape[:2]
+        ink = float(np.mean(t > 0))
+        score = w * h * (0.45 + ink)
+        candidates.append((score, y1, y2))
+
+    if not candidates:
+        return raw, None
+
+    # Major: largest significant band. Minor: next band spatially different.
+    candidates.sort(reverse=True)
+    major_band = candidates[0]
+    major = gray[max(0, major_band[1]-6):min(gray.shape[0], major_band[2]+6), :]
+    major_raw = image_to_jpeg_bytes(major)
+
+    minor_raw = None
+    for c in candidates[1:]:
+        if abs(c[1] - major_band[1]) > max(10, int(gray.shape[0]*0.05)):
+            minor = gray[max(0, c[1]-5):min(gray.shape[0], c[2]+5), :]
+            minor_raw = image_to_jpeg_bytes(minor)
+            break
+    return major_raw, minor_raw
+
+
+# -------------------------- typography profile --------------------------
+
+def typography_features(raw):
+    gray = decode_gray(raw)
+    if gray is None:
+        return {}
+    bw = trim_ink(gray)
+    if bw is None or bw.size == 0:
+        return {}
+
+    h, w = bw.shape[:2]
+    ink = (bw > 0).astype(np.uint8)
+
+    # connected components approximates visual character pieces.
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(ink, 8)
+    comps = []
+    for i in range(1, n):
+        x, y, cw, ch, area = [int(v) for v in stats[i]]
+        if area >= max(10, int(w*h*0.0007)) and ch >= max(4, int(h*0.06)):
+            comps.append((x, y, cw, ch, area))
+    comps.sort(key=lambda q: q[0])
+
+    heights = [c[3] for c in comps] or [h]
+    widths = [c[2] for c in comps] or [w]
+    mh = float(np.median(heights))
+
+    gaps = []
+    for a, b in zip(comps, comps[1:]):
+        gaps.append(max(0, b[0] - (a[0] + a[2])) / max(1.0, mh))
+
+    # stroke width proxy
+    dist = cv2.distanceTransform(ink, cv2.DIST_L2, 5)
+    pos = dist[dist > 0]
+    stroke = 2 * float(np.median(pos)) if len(pos) else 0.0
+    stroke_ratio = stroke / max(1.0, mh)
+
+    # stroke variation: serif/calligraphy tends to vary more than gothic.
+    skel_like = cv2.Canny(bw, 50, 150)
+    edge_density = float(np.mean(skel_like > 0))
+    row_var = float(np.std(np.sum(ink, axis=1)) / max(1.0, np.mean(np.sum(ink, axis=1)) + 1e-6))
+    col_var = float(np.std(np.sum(ink, axis=0)) / max(1.0, np.mean(np.sum(ink, axis=0)) + 1e-6))
+
+    # slant proxy using fitted line through foreground pixels.
+    ys, xs = np.where(ink > 0)
+    slant = 0.0
+    if len(xs) > 30 and np.std(ys) > 1:
+        try:
+            slope = np.polyfit(ys.astype(float), xs.astype(float), 1)[0]
+            slant = float(np.clip(abs(slope) / max(1.0, w/h), 0, 1))
+        except Exception:
+            pass
+
+    # Heuristic probabilities. These are "style family likelihoods", not font-name recognition.
+    gothic = 0.55 + 0.55 * max(0, 0.14 - row_var) + 0.30 * max(0, 0.12 - slant)
+    myeongjo = 0.35 + 0.55 * min(1, row_var) + 0.18 * min(1, edge_density*6)
+    gungseo = 0.25 + 0.75 * min(1, slant*1.7 + row_var*0.45 + col_var*0.25)
+    handwriting = 0.15 + 0.75 * min(1, slant*1.4 + row_var*0.25 + max(0, 0.08-edge_density)*4)
+
+    vals = np.array([gothic, myeongjo, gungseo, handwriting], dtype=float)
+    vals = np.maximum(vals, 0.01)
+    vals = vals / vals.sum() * 100.0
+
+    return {
+        "aspect_ratio": round(w / max(1.0, h), 3),
+        "component_count": len(comps),
+        "median_width_to_height": round(float(np.median(widths)) / max(1.0, mh), 3),
+        "median_gap_to_height": round(float(np.median(gaps)) if gaps else 0.0, 3),
+        "stroke_to_height": round(stroke_ratio, 3),
+        "edge_density": round(edge_density, 4),
+        "row_variation": round(row_var, 3),
+        "column_variation": round(col_var, 3),
+        "slant": round(slant, 3),
+        "font_family_probabilities": {
+            "고딕": round(float(vals[0]), 1),
+            "명조": round(float(vals[1]), 1),
+            "궁서·붓글씨": round(float(vals[2]), 1),
+            "손글씨": round(float(vals[3]), 1),
+        },
+    }
+
+
+def typography_similarity(a, b):
+    if not a or not b:
+        return 0.0
+
+    pa = a.get("font_family_probabilities", {})
+    pb = b.get("font_family_probabilities", {})
+    keys = ["고딕", "명조", "궁서·붓글씨", "손글씨"]
+    va = np.array([float(pa.get(k, 0)) for k in keys])
+    vb = np.array([float(pb.get(k, 0)) for k in keys])
+    if va.sum() and vb.sum():
+        family = 100.0 * (1.0 - np.sum(np.abs(va - vb)) / 200.0)
+    else:
+        family = 0.0
+
+    def close(key, scale):
+        x = float(a.get(key, 0))
+        y = float(b.get(key, 0))
+        return 100.0 * max(0.0, 1.0 - abs(x-y) / max(scale, abs(x), abs(y), 1e-6))
+
+    geometry = (
+        close("aspect_ratio", 1.5) * 0.20
+        + close("median_width_to_height", 0.7) * 0.15
+        + close("median_gap_to_height", 0.35) * 0.20
+        + close("stroke_to_height", 0.12) * 0.25
+        + close("slant", 0.25) * 0.20
+    )
+    return round(family * 0.55 + geometry * 0.45, 1)
+
+
+# -------------------------- full visual / logo --------------------------
+
+def color_profile(raw):
+    img = decode_color(raw)
+    if img is None:
+        return {}
+    hsv = cv2.cvtColor(cv2.resize(img, (96, 96)), cv2.COLOR_BGR2HSV)
+    sat = hsv[:, :, 1]
+    vals = hsv[sat > 35]
+    if not len(vals):
+        vals = hsv.reshape(-1, 3)
+    mean = np.mean(vals, axis=0)
+    h = float(mean[0])
+    family = (
+        "빨강" if h < 10 or h >= 170
+        else "주황" if h < 25
+        else "노랑" if h < 40
+        else "초록" if h < 85
+        else "파랑" if h < 130
+        else "보라"
+    )
+    return {
+        "family": family,
+        "mean_hsv": [round(float(v), 1) for v in mean],
+    }
+
+
+def fit_canvas(bw, W=640, H=260):
+    h, w = bw.shape[:2]
+    scale = min(W / max(1, w), H / max(1, h))
+    nw, nh = max(1, int(w*scale)), max(1, int(h*scale))
+    r = cv2.resize(bw, (nw, nh), interpolation=cv2.INTER_AREA)
+    c = np.zeros((H, W), np.uint8)
+    x, y = (W-nw)//2, (H-nh)//2
+    c[y:y+nh, x:x+nw] = r
+    return c
+
+
+def shape_score(ref_raw, frame_raw):
+    a = trim_ink(decode_gray(ref_raw))
+    b = trim_ink(decode_gray(frame_raw))
+    if a is None or b is None:
+        return 0.0
+    aa, bb = fit_canvas(a), fit_canvas(b)
+    corr = max(0.0, float(cv2.matchTemplate(aa, bb, cv2.TM_CCOEFF_NORMED)[0][0]))
+    ea, eb = cv2.Canny(aa, 50, 140), cv2.Canny(bb, 50, 140)
+    inter = np.logical_and(ea > 0, eb > 0).sum()
+    union = np.logical_or(ea > 0, eb > 0).sum()
+    iou = float(inter / union) if union else 0.0
+    return round(min(100.0, 100.0 * (0.76*corr + 0.24*iou)), 1)
+
+
+def orb_score(ref_raw, frame_raw):
+    a, b = decode_gray(ref_raw), decode_gray(frame_raw)
+    if a is None or b is None:
+        return 0.0
+    orb = cv2.ORB_create(nfeatures=1800, fastThreshold=6)
+    k1, d1 = orb.detectAndCompute(a, None)
+    k2, d2 = orb.detectAndCompute(b, None)
+    if d1 is None or d2 is None or len(k1) < 6 or len(k2) < 6:
+        return 0.0
+    pairs = cv2.BFMatcher(cv2.NORM_HAMMING).knnMatch(d1, d2, k=2)
+    good = [m for pair in pairs if len(pair) == 2 for m, n in [pair] if m.distance < 0.75*n.distance]
+    if len(good) < 4:
+        return min(30.0, len(good)*6.0)
+    coverage = min(1.0, len(good) / max(14.0, min(len(k1), 45.0)))
+    inlier = 0.0
+    if len(good) >= 6:
+        src = np.float32([k1[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
+        dst = np.float32([k2[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+        try:
+            _, mask = cv2.findHomography(src, dst, cv2.RANSAC, 5.0)
+            if mask is not None and len(mask):
+                inlier = float(mask.sum()) / len(mask)
+        except cv2.error:
+            pass
+    return round(min(100.0, 100.0*(0.55*coverage + 0.45*inlier)), 1)
+
+
+def visual_score(ref_raw, frame_raw):
+    sh = shape_score(ref_raw, frame_raw)
+    orb = orb_score(ref_raw, frame_raw)
+    return sh, orb, round(max(sh, 0.60*sh + 0.40*orb), 1)
+
+
+def generate_variants(raw):
+    gray = decode_gray(raw)
+    if gray is None:
+        return {}
+    variants = {
+        "original": gray,
+        "contrast": cv2.convertScaleAbs(gray, alpha=1.45, beta=-18),
+        "blur": cv2.GaussianBlur(gray, (5, 5), 0),
+        "threshold": cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1],
+    }
+    out = {}
+    for name, img in variants.items():
+        b = image_to_jpeg_bytes(img, 78)
+        if b:
+            out[name] = base64.b64encode(b).decode("ascii")
+    return out
+
+
+def infer_mode(major, minor, major_typ, minor_typ):
+    # 기본 등록은 문자 중심. 대분류/소분류가 모두 있으면 TEXT_TYPOGRAPHY.
+    # 문자 없는 등록은 LOGO_ONLY.
+    if major and minor:
+        return "TEXT_TYPOGRAPHY"
+    if major:
+        return "WORDMARK_OR_TEXT"
+    return "LOGO_ONLY"
+
+
+def build_identity_profile(full_raw, major_raw, minor_raw, major, minor):
+    if major_raw is None or (minor and minor_raw is None):
+        auto_major, auto_minor = detect_text_bands(full_raw)
+        if major_raw is None:
+            major_raw = auto_major
+        if minor and minor_raw is None:
+            minor_raw = auto_minor
+
+    major_typ = typography_features(major_raw or full_raw)
+    minor_typ = typography_features(minor_raw) if minor and minor_raw else {}
+    return {
+        "profile_version": "2.0",
+        "mode": infer_mode(major, minor, major_typ, minor_typ),
+        "auto_recognition_terms": build_recognition_terms(major, minor),
+        "major_typography": major_typ,
+        "minor_typography": minor_typ,
+        "full_visual": {
+            "color": color_profile(full_raw),
+            "variants": generate_variants(full_raw),
+        },
+    }
+
+
+def profile_visual_score(row, frame_raw):
+    scores = []
+    sh, orb, vs = visual_score(row.reference_image, frame_raw)
+    scores.append(("original", sh, orb, vs))
+    try:
+        p = json.loads(row.identity_profile or "{}")
+        for name, b64 in p.get("full_visual", {}).get("variants", {}).items():
+            if name == "original":
+                continue
+            raw = base64.b64decode(b64)
+            sh, orb, vs = visual_score(raw, frame_raw)
+            scores.append((name, sh, orb, vs))
+    except Exception:
+        pass
+    return max(scores, key=lambda x: x[3]) if scores else ("none", 0.0, 0.0, 0.0)
+
+
+# -------------------------- candidate / verification --------------------------
+
+def require_admin():
+    return bool(ADMIN_KEY) and request.headers.get("X-Admin-Key", "") == ADMIN_KEY
+
+
+def gps_ok(row, lat, lon):
+    if not row.use_location:
+        return True, None
+    if lat is None or lon is None or row.latitude is None or row.longitude is None:
+        return False, None
+    r = 6371000.0
+    p1, p2 = math.radians(float(lat)), math.radians(float(row.latitude))
+    dp = math.radians(float(row.latitude) - float(lat))
+    dl = math.radians(float(row.longitude) - float(lon))
+    a = math.sin(dp/2)**2 + math.cos(p1)*math.cos(p2)*math.sin(dl/2)**2
+    d = 2*r*math.asin(math.sqrt(a))
+    return d <= row.radius_m, round(d, 1)
+
+
+def candidate_score(ocr_texts, row):
+    f = row.fields()
+    major_scores = [(best_term_score(t, f["major_category"]), t) for t in ocr_texts]
+    major_score, major_ocr = max(major_scores, default=(0.0, ""))
+
+    minors = split_terms(f["minor_category"])
+    minor_hits = []
+    for target in minors:
+        best = max((best_term_score(t, target), t) for t in ocr_texts) if ocr_texts else (0.0, "")
+        minor_hits.append({"target": target, "score": round(best[0], 1), "ocr": best[1]})
+
+    if minors:
+        # 하나의 긴 소분류 문자열이 아니라, 등록된 소분류 토큰 중 보이는 증거를 활용.
+        good = [h["score"] for h in minor_hits if h["score"] >= 58]
+        minor_score = sum(sorted(good, reverse=True)[:3]) / min(3, len(minors)) if good else 0.0
+        minor_coverage = len(good) / len(minors)
+    else:
+        minor_score = 100.0
+        minor_coverage = 1.0
+
+    # 대분류는 기준축. 소분류가 존재할 경우 최소 하나 이상의 증거를 요구.
+    major_ok = major_score >= 58.0
+    minor_ok = (not minors) or any(h["score"] >= 58.0 for h in minor_hits)
+
+    combined = major_score * 0.70 + minor_score * 0.30
+    if major_score >= 82:
+        combined += 4.0
+    return {
+        "major_score": round(min(100, major_score), 1),
+        "major_ocr": major_ocr,
+        "minor_score": round(min(100, minor_score), 1),
+        "minor_coverage": round(minor_coverage, 3),
+        "minor_hits": minor_hits,
+        "text_score": round(min(100, combined), 1),
+        "eligible": bool(major_ok and minor_ok),
+    }
+
+
+# -------------------------- routes --------------------------
+
+INDEX_HTML = r"""<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>LUPER Registry V0.6.0</title>
+<style>
+body{font-family:system-ui,-apple-system,sans-serif;background:#f5f6f8;color:#17191c;margin:0}
+.w{max-width:1220px;margin:22px auto;padding:0 15px}.c{background:#fff;border:1px solid #ddd;border-radius:14px;padding:18px;margin:13px 0}
+.g{display:grid;grid-template-columns:1fr 1fr;gap:12px}.g3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px}
+label{display:block;font-size:13px;color:#555;margin-bottom:5px}input,select{width:100%;box-sizing:border-box;padding:10px;border:1px solid #ccd1d7;border-radius:8px}
+.full{grid-column:1/-1}.row{display:flex;gap:8px;align-items:center}.row input[type=checkbox]{width:auto}
+button{border:0;border-radius:8px;background:#111;color:#fff;font-weight:700;padding:10px 13px;cursor:pointer}
+.muted{font-size:13px;color:#666}.ok{color:#18723a;font-weight:700}.warn{color:#a22;font-weight:700}
+table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:8px;border-bottom:1px solid #eee;text-align:left;vertical-align:top}
+.profile{white-space:pre-wrap;font:12px/1.5 ui-monospace,monospace;background:#101114;color:#eee;padding:10px;border-radius:8px}
+@media(max-width:820px){.g,.g3{grid-template-columns:1fr}.full{grid-column:auto}table{display:block;overflow:auto}}
+</style></head>
+<body><div class="w">
+<h2>LUPER LIVE Registry V0.6.0</h2>
+<p><b>문자 → 후보 → 대/소분류 Typography → Visual/Logo → GPS → 5초 링크카드</b></p>
+
+<div class="c">
+<label>관리자 키</label><div class="row"><input id="admin" type="password"><button id="saveKey">키 저장</button></div>
+</div>
+
+<div class="c"><form id="f"><div class="g">
+<div><label>등록명</label><input id="regname" required placeholder="살만온족발_메뉴_01"></div>
+<div><label>표시명</label><input id="display" required placeholder="살만온족발 메뉴"></div>
+<div><label>대분류 · 기준 문자/상호</label><input id="major" required placeholder="살만온족발"></div>
+<div><label>소분류 · 보조 문자</label><input id="minor" placeholder="족발 보쌈 닭발"></div>
+<div class="full"><label>인식문자 · 자동 생성</label><input id="recognition" disabled></div>
+<div class="full"><label>URL</label><input id="url" required placeholder="https://..."></div>
+<div class="full"><label>전체 기준 이미지</label><input id="fullImg" type="file" accept="image/*" required></div>
+<div><label>대분류 문자 Crop (선택 · 없으면 자동추정)</label><input id="majorImg" type="file" accept="image/*"></div>
+<div><label>소분류 문자 Crop (선택 · 없으면 자동추정)</label><input id="minorImg" type="file" accept="image/*"></div>
+<div><label>등록 유형</label><select id="mode"><option value="auto">자동</option><option value="TEXT_TYPOGRAPHY">문자+글자체 중심</option><option value="WORDMARK_OR_TEXT">워드마크/문자</option><option value="TEXT_LOGO">문자+로고</option><option value="LOGO_ONLY">로고만</option></select></div>
+<div><label>기본 Visual 기준</label><input id="thr" type="number" value="48" min="0" max="100"></div>
+<div class="row"><input id="useGps" type="checkbox"><label for="useGps" style="margin:0">GPS 사용</label></div>
+<div><label>반경(m)</label><input id="radius" type="number" value="150"></div>
+<div><label>위도</label><input id="lat" type="number" step="any"></div><div><label>경도</label><input id="lon" type="number" step="any"></div>
+<div class="full"><button>등록 + 원본 사전분석</button></div>
+</div></form></div>
+
+<div class="c">
+<h3>등록목록 / 사전분석 결과</h3><div id="state" class="muted"></div><div id="list"></div>
+</div>
+</div>
+<script>
+const $=id=>document.getElementById(id), esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+$('admin').value=sessionStorage.getItem('luper_admin')||'';
+$('saveKey').onclick=()=>{sessionStorage.setItem('luper_admin',$('admin').value);refresh()};
+const ah=()=>({'X-Admin-Key':$('admin').value});
+function file64(f){return new Promise((ok,no)=>{if(!f)return ok(null);let r=new FileReader();r.onload=()=>ok(r.result);r.onerror=no;r.readAsDataURL(f)})}
+function updateRec(){const a=$('major').value.trim(), b=$('minor').value.trim();const ms=b.split(/[\s,|/·]+/).filter(Boolean);let t=[];if(a)t.push(a);for(const m of ms){t.push(m);if(a){t.push(a+' '+m);t.push(a+m)}}$('recognition').value=[...new Set(t)].join(' | ')}
+$('major').oninput=updateRec;$('minor').oninput=updateRec;
+
+async function refresh(){
+ const h=await (await fetch('/health')).json();$('state').innerHTML=`<span class="ok">ONLINE</span> V${h.version} · ${h.entries}개`;
+ const r=await fetch('/api/entries',{headers:ah()});if(r.status===401){$('list').innerHTML='<p class="warn">관리자 키를 저장하세요.</p>';return}
+ const a=await r.json();let s='<table><tr><th>등록명</th><th>대분류</th><th>소분류</th><th>자동 인식문자</th><th>타이포그래피</th><th>유형</th><th>URL</th><th></th></tr>';
+ for(const x of a){
+  const M=x.profile_summary?.major_typography||{}, m=x.profile_summary?.minor_typography||{};
+  s+=`<tr><td><b>${esc(x.registration_name)}</b></td><td>${esc(x.major_category)}</td><td>${esc(x.minor_category)}</td><td>${esc(x.recognition_text)}</td><td>대: ${esc(JSON.stringify(M))}<br>소: ${esc(JSON.stringify(m))}</td><td>${esc(x.profile_summary?.mode||x.match_mode)}</td><td><a href="${esc(x.url)}" target="_blank">열기</a></td><td><button onclick="delx(${x.id})">삭제</button></td></tr>`;
+ }
+ $('list').innerHTML=s+'</table>';
+}
+async function delx(id){if(!confirm('삭제할까요?'))return;await fetch('/api/entries/'+id,{method:'DELETE',headers:ah()});refresh()}
+$('f').onsubmit=async e=>{
+ e.preventDefault();if(!$('admin').value)return alert('관리자 키를 저장하세요.');
+ const body={registration_name:$('regname').value,display_name:$('display').value,major_category:$('major').value,minor_category:$('minor').value,url:$('url').value,match_mode:$('mode').value,visual_threshold:+$('thr').value||48,use_location:$('useGps').checked,radius_m:+$('radius').value||150,latitude:$('lat').value?+$('lat').value:null,longitude:$('lon').value?+$('lon').value:null,
+ reference_image_base64:await file64($('fullImg').files[0]),major_image_base64:await file64($('majorImg').files[0]),minor_image_base64:await file64($('minorImg').files[0])};
+ const r=await fetch('/api/entries',{method:'POST',headers:{'Content-Type':'application/json','X-Admin-Key':$('admin').value},body:JSON.stringify(body)});
+ const x=await r.json();if(!r.ok)return alert(JSON.stringify(x));
+ alert('등록 및 사전분석 완료');refresh();
+};
+refresh();updateRec();
+</script></body></html>"""
+
+
 @app.get("/")
-def index():return Response(INDEX_HTML,content_type="text/html; charset=utf-8")
+def index():
+    return Response(INDEX_HTML, content_type="text/html; charset=utf-8")
+
+
 @app.get("/health")
-def health():return jsonify(ok=True,version=VERSION,database=db.engine.url.get_backend_name(),entries=Link.query.count())
+def health():
+    return jsonify(ok=True, version=VERSION, database=db.engine.url.get_backend_name(), entries=Link.query.count())
+
+
 @app.get("/api/entries")
 def entries():
- if not require_admin():return jsonify(error="unauthorized"),401
- return jsonify([x.public_dict() for x in Link.query.filter_by(enabled=True).order_by(Link.priority.desc(),Link.id.desc()).all()])
+    if not require_admin():
+        return jsonify(error="unauthorized"), 401
+    rows = Link.query.filter_by(enabled=True).order_by(Link.priority.desc(), Link.id.desc()).all()
+    return jsonify([r.public_dict() for r in rows])
+
+
 @app.post("/api/entries")
 def create_entry():
- if not require_admin():return jsonify(error="unauthorized"),401
- x=request.get_json(silent=True) or {};needed=("registration_name","display_name","major_category","url","reference_image_base64")
- if not all(str(x.get(k,"")).strip() for k in needed):return jsonify(error="등록명/표시명/대분류/URL/기준이미지는 필수입니다."),400
- raw=b64_bytes(x.get("reference_image_base64"));use=bool(x.get("use_location"))
- if not raw or decode_gray(raw) is None:return jsonify(error="기준이미지를 읽을 수 없습니다."),400
- if use and (x.get("latitude") is None or x.get("longitude") is None):return jsonify(error="GPS 사용 시 위도/경도가 필요합니다."),400
- major=str(x["major_category"]).strip();item=Link(key_text=major,registration_name=str(x["registration_name"]).strip(),major_category=major,minor_category=str(x.get("minor_category","")).strip(),recognition_text=" ".join(dict.fromkeys([v for v in [major,str(x.get("minor_category","")).strip()] if v])),display_name=str(x["display_name"]).strip(),url=str(x["url"]).strip(),reference_image=raw,visual_threshold=float(x.get("visual_threshold") or 55),priority=int(x.get("priority") or 0),use_location=use,latitude=float(x["latitude"]) if x.get("latitude") is not None else None,longitude=float(x["longitude"]) if x.get("longitude") is not None else None,radius_m=float(x.get("radius_m") or 150));item.identity_profile=json.dumps(build_identity_profile(raw,major,str(x.get("minor_category","")).strip()),ensure_ascii=False);db.session.add(item);db.session.commit();return jsonify(item.public_dict()),201
+    if not require_admin():
+        return jsonify(error="unauthorized"), 401
+    x = request.get_json(silent=True) or {}
+    major = str(x.get("major_category", "")).strip()
+    minor = str(x.get("minor_category", "")).strip()
+    if not all([x.get("registration_name"), x.get("display_name"), major, x.get("url"), x.get("reference_image_base64")]):
+        return jsonify(error="등록명/표시명/대분류/URL/전체 기준이미지는 필수입니다."), 400
+
+    full_raw = b64_bytes(x.get("reference_image_base64"))
+    major_raw = b64_bytes(x.get("major_image_base64"))
+    minor_raw = b64_bytes(x.get("minor_image_base64"))
+    if decode_gray(full_raw) is None:
+        return jsonify(error="전체 기준이미지를 읽을 수 없습니다."), 400
+
+    profile = build_identity_profile(full_raw, major_raw, minor_raw, major, minor)
+    mode = str(x.get("match_mode") or "auto")
+    if mode == "auto":
+        mode = profile.get("mode") or "TEXT_TYPOGRAPHY"
+    profile["mode"] = mode
+
+    item = Link(
+        key_text=major,
+        registration_name=str(x["registration_name"]).strip(),
+        major_category=major,
+        minor_category=minor,
+        recognition_text=build_recognition_text(major, minor),
+        display_name=str(x["display_name"]).strip(),
+        url=str(x["url"]).strip(),
+        match_mode=mode,
+        reference_image=full_raw,
+        major_reference=major_raw,
+        minor_reference=minor_raw,
+        visual_threshold=float(x.get("visual_threshold") or 48),
+        priority=int(x.get("priority") or 0),
+        use_location=bool(x.get("use_location")),
+        latitude=float(x["latitude"]) if x.get("latitude") is not None else None,
+        longitude=float(x["longitude"]) if x.get("longitude") is not None else None,
+        radius_m=float(x.get("radius_m") or 150),
+        identity_profile=json.dumps(profile, ensure_ascii=False),
+    )
+    db.session.add(item)
+    db.session.commit()
+    return jsonify(item.public_dict()), 201
+
+
 @app.delete("/api/entries/<int:item_id>")
 def delete_entry(item_id):
- if not require_admin():return jsonify(error="unauthorized"),401
- item=db.session.get(Link,item_id)
- if not item:return jsonify(error="not found"),404
- db.session.delete(item);db.session.commit();return jsonify(ok=True)
-@app.post("/api/visual_diagnostic")
-def visual_diagnostic():
- if not require_admin():return jsonify(error="unauthorized"),401
- x=request.get_json(silent=True) or {};item=db.session.get(Link,int(x.get("entry_id") or 0));test=b64_bytes(x.get("test_image_base64"))
- if not item or not test:return jsonify(error="entry/image required"),400
- sh,orb,final=visual_components(item.reference_image,test);return jsonify(registration_name=item.normalized_fields()["registration_name"],shape_score=sh,orb_score=orb,visual_score=final,visual_threshold=item.visual_threshold)
-@app.post("/api/match_blocks")
-def match_blocks():
- x=request.get_json(silent=True) or {};blocks=x.get("blocks") or [];lat,lon=x.get("lat"),x.get("lon");usable=[]
- for block in blocks[:16]:
-  ocr=str((block or {}).get("text","")).strip();crop=b64_bytes((block or {}).get("crop_jpeg_base64"))
-  if len(norm(ocr))>=2 and crop:usable.append((ocr,crop))
- candidates=[]
- for r in Link.query.filter_by(enabled=True).all():
-  f=r.normalized_fields();bm=(0,None);bs=(100,None) if not f["minor_category"] else (0,None)
-  for ocr,crop in usable:
-   ma=max(sim(ocr,f["major_category"]),token_best(ocr,f["major_category"]));mi=max(sim(ocr,f["minor_category"]),token_best(ocr,f["minor_category"])) if f["minor_category"] else 100
-   if ma>bm[0]:bm=(ma,(ocr,crop))
-   if f["minor_category"] and mi>bs[0]:bs=(mi,(ocr,crop))
-  if bm[0]>=58 and ((not f["minor_category"]) or bs[0]>=58):
-   chosen=bm[1] or bs[1]
-   if chosen:candidates.append({"r":r,"ocr":chosen[0],"crop":chosen[1],"major":bm[0],"minor":bs[0],"text":bm[0]*.62+bs[0]*.38})
- candidates=sorted(candidates,key=lambda c:(c["text"],c["r"].priority),reverse=True)[:5];matches=[];diagnostics=[]
- for c in candidates:
-  r=c["r"];variant,sh,orb,vs=profile_visual_score(r,c["crop"]);threshold=float(r.visual_threshold or 55);floor=max(32,threshold-(12 if c["text"]>=88 else 6 if c["text"]>=76 else 0));dist=None;gps=True
-  if r.use_location:
-   if lat is None or lon is None or r.latitude is None or r.longitude is None:gps=False
-   else:dist=hav(float(lat),float(lon),r.latitude,r.longitude);gps=dist<=r.radius_m
-  passed=vs>=floor and gps;d={"id":r.id,"registration_name":r.normalized_fields()["registration_name"],"display_name":r.display_name,"ocr_text":c["ocr"],"major_score":round(c["major"],1),"minor_score":round(c["minor"],1),"text_score":round(c["text"],1),"shape_score":sh,"orb_score":orb,"visual_score":vs,"visual_threshold":threshold,"adaptive_visual_floor":floor,"best_profile_variant":variant,"gps_ok":gps,"distance_m":round(dist,1) if dist is not None else None,"passed":passed};diagnostics.append(d)
-  if passed:
-   z=r.public_dict();z.update(d);z["score"]=round(c["text"]*.72+vs*.28+r.priority,1);matches.append(z)
- matches.sort(key=lambda z:z["score"],reverse=True);diagnostics.sort(key=lambda z:(z["passed"],z["text_score"]+z["visual_score"]),reverse=True);return jsonify(matches=matches,diagnostics=diagnostics,version=VERSION)
+    if not require_admin():
+        return jsonify(error="unauthorized"), 401
+    item = db.session.get(Link, item_id)
+    if not item:
+        return jsonify(error="not found"), 404
+    db.session.delete(item)
+    db.session.commit()
+    return jsonify(ok=True)
 
-def migrate_columns():
- insp=inspect(db.engine)
- if "links" not in insp.get_table_names():return
- cols={c["name"] for c in insp.get_columns("links")};adds=[("registration_name","VARCHAR(300)"),("major_category","VARCHAR(300)"),("minor_category","VARCHAR(500)"),("recognition_text","VARCHAR(1000)"),("identity_profile","TEXT")]
- with db.engine.begin() as conn:
-  for name,typ in adds:
-   if name not in cols:conn.execute(sql_text(f"ALTER TABLE links ADD COLUMN {name} {typ}"))
-  conn.execute(sql_text("UPDATE links SET registration_name=COALESCE(NULLIF(registration_name,''),display_name,key_text), major_category=COALESCE(NULLIF(major_category,''),key_text), recognition_text=COALESCE(NULLIF(recognition_text,''),key_text), minor_category=COALESCE(minor_category,'')"))
-with app.app_context():db.create_all();migrate_columns()
-if __name__=="__main__":app.run(host="0.0.0.0",port=int(os.getenv("PORT","8788")),debug=False)
+
+@app.post("/api/candidates")
+def candidates():
+    x = request.get_json(silent=True) or {}
+    texts = [str(t).strip() for t in (x.get("texts") or []) if len(norm(str(t))) >= 2]
+    if not texts:
+        return jsonify(candidates=[], version=VERSION)
+
+    out = []
+    for row in Link.query.filter_by(enabled=True).all():
+        c = candidate_score(texts, row)
+        if c["eligible"]:
+            d = row.public_dict()
+            d.update(c)
+            out.append(d)
+    out.sort(key=lambda q: (q["text_score"], q["priority"]), reverse=True)
+    return jsonify(candidates=out[:8], version=VERSION)
+
+
+@app.post("/api/verify")
+def verify():
+    x = request.get_json(silent=True) or {}
+    lat, lon = x.get("lat"), x.get("lon")
+    candidate_ids = [int(v) for v in (x.get("candidate_ids") or [])[:8]]
+    crops = x.get("crops") or []
+
+    crop_items = []
+    for c in crops[:16]:
+        raw = b64_bytes((c or {}).get("image_base64"))
+        text = str((c or {}).get("text", "")).strip()
+        if raw and decode_gray(raw) is not None:
+            crop_items.append((text, raw))
+
+    results, diagnostics = [], []
+    for cid in candidate_ids:
+        row = db.session.get(Link, cid)
+        if not row or not row.enabled:
+            continue
+        f = row.fields()
+        try:
+            profile = json.loads(row.identity_profile or "{}")
+        except Exception:
+            profile = {}
+
+        best_major = (0.0, "", None)
+        best_minor = (0.0, "", None)
+        best_visual = (0.0, "", 0.0, 0.0, 0.0)
+
+        # Typography compares only candidate-relevant crops.
+        for txt, raw in crop_items:
+            maj_text = best_term_score(txt, f["major_category"])
+            if maj_text >= 48:
+                typ = typography_similarity(profile.get("major_typography", {}), typography_features(raw))
+                if typ > best_major[0]:
+                    best_major = (typ, txt, raw)
+
+            if f["minor_category"]:
+                minor_text = max((best_term_score(txt, t) for t in split_terms(f["minor_category"])), default=0)
+                if minor_text >= 48:
+                    typ = typography_similarity(profile.get("minor_typography", {}), typography_features(raw))
+                    if typ > best_minor[0]:
+                        best_minor = (typ, txt, raw)
+
+            variant, sh, orb, vs = profile_visual_score(row, raw)
+            if vs > best_visual[0]:
+                best_visual = (vs, variant, sh, orb, vs)
+
+        # Full registration mode controls visual weight / floor.
+        mode = row.match_mode or profile.get("mode") or "TEXT_TYPOGRAPHY"
+        major_typ = best_major[0]
+        minor_typ = best_minor[0] if f["minor_category"] else 100.0
+        visual = best_visual[0]
+
+        # Recompute text evidence from crop texts for final score.
+        tc = candidate_score([t for t, _ in crop_items], row)
+        text_score = tc["text_score"]
+
+        if mode == "LOGO_ONLY":
+            weights = (0.00, 0.00, 1.00)
+            visual_floor = max(62.0, row.visual_threshold)
+        elif mode == "WORDMARK_OR_TEXT":
+            weights = (0.55, 0.20, 0.25)
+            visual_floor = max(38.0, row.visual_threshold - 8)
+        elif mode == "TEXT_LOGO":
+            weights = (0.58, 0.22, 0.20)
+            visual_floor = max(30.0, row.visual_threshold - 14)
+        else:  # TEXT_TYPOGRAPHY
+            weights = (0.62, 0.28, 0.10)
+            visual_floor = max(24.0, row.visual_threshold - 18)
+
+        typo_score = major_typ * 0.70 + minor_typ * 0.30
+        final_conf = text_score * weights[0] + typo_score * weights[1] + visual * weights[2]
+
+        # Strong text + typography is allowed to survive a low logo/full-image score.
+        visual_ok = visual >= visual_floor
+        if mode != "LOGO_ONLY" and text_score >= 84 and typo_score >= 58:
+            visual_ok = visual >= max(18.0, visual_floor - 12)
+
+        gok, dist = gps_ok(row, lat, lon)
+        passed = bool(tc["eligible"] and visual_ok and gok and final_conf >= (58 if mode != "LOGO_ONLY" else 66))
+
+        d = {
+            "id": row.id,
+            "registration_name": f["registration_name"],
+            "display_name": f["display_name"],
+            "major_category": f["major_category"],
+            "minor_category": f["minor_category"],
+            "url": row.url,
+            "match_mode": mode,
+            "text_score": round(text_score, 1),
+            "major_text_score": tc["major_score"],
+            "minor_text_score": tc["minor_score"],
+            "major_typography_score": round(major_typ, 1),
+            "minor_typography_score": round(minor_typ, 1),
+            "typography_score": round(typo_score, 1),
+            "visual_score": round(visual, 1),
+            "visual_floor": round(visual_floor, 1),
+            "best_visual_variant": best_visual[1],
+            "final_confidence": round(final_conf, 1),
+            "gps_ok": gok,
+            "distance_m": dist,
+            "passed": passed,
+        }
+        diagnostics.append(d)
+        if passed:
+            results.append(d)
+
+    results.sort(key=lambda q: (q["final_confidence"], q["text_score"]), reverse=True)
+    diagnostics.sort(key=lambda q: (q["passed"], q["final_confidence"]), reverse=True)
+    return jsonify(matches=results, diagnostics=diagnostics, version=VERSION)
+
+
+def migrate():
+    db.create_all()
+    insp = inspect(db.engine)
+    if "links" not in insp.get_table_names():
+        return
+    cols = {c["name"] for c in insp.get_columns("links")}
+    additions = [
+        ("registration_name", "VARCHAR(300)"),
+        ("major_category", "VARCHAR(300)"),
+        ("minor_category", "VARCHAR(500)"),
+        ("recognition_text", "VARCHAR(1500)"),
+        ("match_mode", "VARCHAR(30)"),
+        ("major_reference", "BLOB"),
+        ("minor_reference", "BLOB"),
+        ("identity_profile", "TEXT"),
+    ]
+    with db.engine.begin() as conn:
+        for name, typ in additions:
+            if name not in cols:
+                conn.execute(sql_text(f"ALTER TABLE links ADD COLUMN {name} {typ}"))
+        conn.execute(sql_text("""
+        UPDATE links SET
+          registration_name=COALESCE(NULLIF(registration_name,''),display_name,key_text),
+          major_category=COALESCE(NULLIF(major_category,''),key_text),
+          minor_category=COALESCE(minor_category,''),
+          recognition_text=COALESCE(NULLIF(recognition_text,''),key_text),
+          match_mode=COALESCE(NULLIF(match_mode,''),'auto')
+        """))
+
+    # legacy rows receive the new profile.
+    for row in Link.query.all():
+        f = row.fields()
+        desired = build_recognition_text(f["major_category"], f["minor_category"])
+        changed = False
+        if row.recognition_text != desired:
+            row.recognition_text = desired
+            changed = True
+        if not row.identity_profile:
+            try:
+                p = build_identity_profile(
+                    row.reference_image,
+                    row.major_reference,
+                    row.minor_reference,
+                    f["major_category"],
+                    f["minor_category"],
+                )
+                if row.match_mode and row.match_mode != "auto":
+                    p["mode"] = row.match_mode
+                row.identity_profile = json.dumps(p, ensure_ascii=False)
+                changed = True
+            except Exception:
+                pass
+        if changed:
+            db.session.add(row)
+    db.session.commit()
+
+
+with app.app_context():
+    migrate()
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8788")), debug=False)
