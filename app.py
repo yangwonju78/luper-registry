@@ -26,7 +26,7 @@ app.config["MAX_CONTENT_LENGTH"] = 15 * 1024 * 1024
 
 db = SQLAlchemy(app)
 ADMIN_KEY = os.getenv("ADMIN_KEY", "change-me")
-VERSION = "0.7.1"
+VERSION = "0.7.2"
 
 
 class Link(db.Model):
@@ -739,8 +739,10 @@ def build_identity_profile(full_raw, major_raw, minor_raw, major, minor):
 
 def profile_visual_score(row, frame_raw):
     """
-    SIFT+Homography is primary.
-    Legacy shape/orb remains secondary for cases with too few SIFT features.
+    V0.7.2 FAST:
+    1) SIFT+Homography first.
+    2) Strong SIFT => return immediately; no ORB/Shape.
+    3) Only weak SIFT uses legacy fallback.
     """
     try:
         p = json.loads(row.identity_profile or "{}")
@@ -751,27 +753,39 @@ def profile_visual_score(row, frame_raw):
     if not sift_fp:
         sift_fp = sift_fingerprint(row.reference_image)
 
-    sift_diag = sift_homography_score_from_fp(sift_fp, frame_raw)
-    sift_score = float(sift_diag.get("score", 0.0))
+    sd = sift_homography_score_from_fp(sift_fp, frame_raw)
+    sift_score = float(sd.get("score", 0.0))
+    strong = (
+        sd.get("homography")
+        and sd.get("inliers", 0) >= 20
+        and sd.get("inlier_ratio", 0) >= 0.70
+        and sift_score >= 88.0
+    )
 
-    # Legacy score only as support; never allowed to suppress a strong homography.
+    if strong:
+        return round(sift_score, 1), {
+            **sd,
+            "legacy_shape": None,
+            "legacy_orb": None,
+            "legacy_visual": None,
+            "method": "SIFT_FAST",
+        }
+
     sh, orb, legacy = visual_score(row.reference_image, frame_raw)
-
-    if sift_diag.get("homography") and sift_diag.get("inliers", 0) >= 8:
+    if sd.get("homography") and sd.get("inliers", 0) >= 8:
         final = max(sift_score, sift_score * 0.88 + legacy * 0.12)
         method = "SIFT_HOMOGRAPHY"
     else:
         final = max(sift_score * 0.60 + legacy * 0.40, legacy * 0.75)
         method = "SIFT_FALLBACK"
 
-    diag = {
-        **sift_diag,
+    return round(min(100.0, final), 1), {
+        **sd,
         "legacy_shape": sh,
         "legacy_orb": orb,
         "legacy_visual": legacy,
         "method": method,
     }
-    return round(min(100.0, final), 1), diag
 
 
 # -------------------------- candidate / verification --------------------------
@@ -838,7 +852,7 @@ INDEX_HTML = r"""<!doctype html>
 <html lang="ko">
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>LUPER Registry V0.7.1</title>
+<title>LUPER Registry V0.7.2</title>
 <style>
 body{font-family:system-ui,-apple-system,sans-serif;background:#f5f6f8;color:#17191c;margin:0}
 .w{max-width:1220px;margin:22px auto;padding:0 15px}.c{background:#fff;border:1px solid #ddd;border-radius:14px;padding:18px;margin:13px 0}
@@ -852,7 +866,7 @@ table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:8px;borde
 @media(max-width:820px){.g,.g3{grid-template-columns:1fr}.full{grid-column:auto}table{display:block;overflow:auto}}
 </style></head>
 <body><div class="w">
-<h2>LUPER LIVE Registry V0.7.1</h2>
+<h2>LUPER LIVE Registry V0.7.2</h2>
 <p><b>문자 → 후보 → Typography → SIFT+Homography Visual ID 확정 → GPS → 5초 링크카드</b></p>
 
 <div class="c">
@@ -1040,7 +1054,7 @@ def verify():
     crops = x.get("crops") or []
 
     crop_items = []
-    for c in crops[:9]:
+    for c in crops[:3]:
         raw = b64_bytes((c or {}).get("image_base64"))
         text = str((c or {}).get("text", "")).strip()
         if raw and decode_gray(raw) is not None:
@@ -1084,13 +1098,29 @@ def verify():
             if prev is None or vs > prev[0]:
                 frame_visuals[frame_index] = (vs, vdiag)
 
+            # One very strong geometric identification is enough for a fast path.
+            if (
+                vdiag.get("method") == "SIFT_FAST"
+                and vs >= 92.0
+                and vdiag.get("inliers", 0) >= 30
+                and vdiag.get("inlier_ratio", 0) >= 0.80
+            ):
+                break
+
         # Full registration mode controls visual weight / floor.
         mode = row.match_mode or profile.get("mode") or "TEXT_TYPOGRAPHY"
         major_typ = best_major[0]
         minor_typ = best_minor[0] if f["minor_category"] else 100.0
         visual_values = sorted((v[0] for v in frame_visuals.values()), reverse=True)
-        if len(visual_values) >= 2:
-            # 3컷 중 한 장의 우연한 고득점보다 반복되는 시각 증거를 우선.
+        best_diag = best_visual[1] if len(best_visual) > 1 else {}
+        if (
+            visual_values
+            and best_diag.get("method") == "SIFT_FAST"
+            and best_diag.get("inliers", 0) >= 30
+            and best_diag.get("inlier_ratio", 0) >= 0.80
+        ):
+            visual = visual_values[0]
+        elif len(visual_values) >= 2:
             visual = sum(visual_values[:2]) / 2.0
         elif visual_values:
             visual = visual_values[0]
