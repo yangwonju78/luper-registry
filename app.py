@@ -28,7 +28,7 @@ app.config["MAX_CONTENT_LENGTH"] = 15 * 1024 * 1024
 
 db = SQLAlchemy(app)
 ADMIN_KEY = os.getenv("ADMIN_KEY", "change-me")
-VERSION = "0.8.0.9"
+VERSION = "0.8.1.1"
 
 
 class Link(db.Model):
@@ -186,10 +186,67 @@ def normalize_detected_texts(items):
         })
     return out[:80]
 
-def detected_text_terms(items):
+
+TEXT_SIZE_GATE_PCT=5.0
+TEXT_SIZE_SOFT_MIN_PCT=3.0
+TEXT_SIZE_SOFT_CONF=75.0
+
+def _hint_similarity_simple(text,registration_name,display_name):
+    target_terms=context_recognition_terms(registration_name,display_name)
+    if not target_terms:return 0.0
+    return max((best_term_score(text,t) for t in target_terms),default=0.0)
+
+def apply_text_size_gate(items,image_h,registration_name="",display_name=""):
     rows=normalize_detected_texts(items)
+    out=[]
+    for r in rows:
+        b=r["bbox"]
+        hpct=(max(1,b["y1"]-b["y0"])/max(1,image_h))*100.0
+        conf=float(r.get("confidence",0) or 0)
+        hint_score=_hint_similarity_simple(r["text"],registration_name,display_name)
+
+        passed=False
+        reason=""
+        if hpct>=TEXT_SIZE_GATE_PCT:
+            passed=True
+            reason="HEIGHT>=5%"
+        elif hpct>=TEXT_SIZE_SOFT_MIN_PCT and (conf>=TEXT_SIZE_SOFT_CONF or hint_score>=72.0):
+            passed=True
+            reason="HEIGHT_3~5%_SOFT_PASS"
+        elif hpct<TEXT_SIZE_SOFT_MIN_PCT:
+            passed=False
+            reason="HEIGHT<3%"
+        else:
+            passed=False
+            reason="HEIGHT_3~5%_LOW_CONF"
+
+        x=dict(r)
+        x["height_pct"]=round(hpct,1)
+        x["hint_score"]=round(hint_score,1)
+        x["size_gate_passed"]=passed
+        x["size_gate_reason"]=reason
+        out.append(x)
+    return out
+
+def detected_text_terms(items,image_h=None,registration_name="",display_name=""):
+    if image_h is None:
+        rows=normalize_detected_texts(items)
+    else:
+        rows=apply_text_size_gate(items,image_h,registration_name,display_name)
+        rows=[r for r in rows if r.get("size_gate_passed")]
+
+    def usable(r):
+        t=r["text"].strip()
+        chars=[c for c in t if not c.isspace()]
+        if not chars:return False
+        useful=sum(1 for c in chars if c.isalnum() or ("가"<=c<="힣"))
+        ratio=useful/max(1,len(chars))
+        return r.get("confidence",0)>=42 and ratio>=0.65
+
+    rows=[r for r in rows if usable(r)]
     terms=[r["text"] for r in rows if r["text"]]
     ordered=sorted(rows,key=lambda r:(r["bbox"]["y0"],r["bbox"]["x0"]))
+
     for a,b in zip(ordered,ordered[1:]):
         ah=max(1,a["bbox"]["y1"]-a["bbox"]["y0"])
         bh=max(1,b["bbox"]["y1"]-b["bbox"]["y0"])
@@ -198,6 +255,7 @@ def detected_text_terms(items):
         minw=max(1,min(a["bbox"]["x1"]-a["bbox"]["x0"],b["bbox"]["x1"]-b["bbox"]["x0"]))
         if gap<=max(ah,bh)*1.2 and overlap/minw>=0.25:
             terms.extend([a["text"]+" "+b["text"],a["text"]+b["text"]])
+
     return list(dict.fromkeys(t for t in terms if len(norm(t))>=2))
 
 def script_type(text):
@@ -254,7 +312,8 @@ def region_identity_profiles(full_raw,detected):
     if img is None:return []
     H,W=img.shape[:2]
     out=[]
-    for r in normalize_detected_texts(detected):
+    gated=apply_text_size_gate(detected,H,"","")
+    for r in gated:
         b=r["bbox"];box=(b["x0"],b["y0"],b["x1"],b["y1"])
         cw=max(1,box[2]-box[0]);ch=max(1,box[3]-box[1])
         wr=cw/max(1,W);hr=ch/max(1,H);area=wr*hr
@@ -267,6 +326,7 @@ def region_identity_profiles(full_raw,detected):
         top_font=max(fam.items(),key=lambda kv:kv[1]) if fam else None
         out.append({
           "text":r["text"],"script":script_type(r["text"]),"confidence":r["confidence"],
+          "height_pct":r.get("height_pct"),"size_gate_passed":r.get("size_gate_passed"),"size_gate_reason":r.get("size_gate_reason"),
           "role":role,"importance":round(importance,1),
           "position":{
             "x_pct":round(box[0]/max(1,W)*100,1),
@@ -297,11 +357,19 @@ def image_design_profile(raw,regions):
 
 def analyze_registration_image(full_raw,registration_name,display_name,detected_texts=None):
     detected=normalize_detected_texts(detected_texts or [])
-    text_identity=region_identity_profiles(full_raw,detected)
+    img0=decode_color(full_raw)
+    image_h=img0.shape[0] if img0 is not None else 1
+
+    gated_detected=apply_text_size_gate(
+        detected,image_h,registration_name,display_name
+    )
+    text_identity=region_identity_profiles(full_raw,gated_detected)
     primary_raw,secondary_raw=detect_text_bands(full_raw)
 
     context_base=context_recognition_terms(registration_name,display_name)
-    image_terms=detected_text_terms(detected)
+    image_terms=detected_text_terms(
+        gated_detected,image_h,registration_name,display_name
+    )
     recognition_terms=list(dict.fromkeys(context_base+image_terms))
 
     p={
@@ -343,6 +411,13 @@ def registration_analysis_summary(profile):
       "full_color":profile.get("full_visual",{}).get("color",{}),
       "sift_features":profile.get("full_visual",{}).get("sift",{}).get("count",0),
       "ocr_ready":bool(profile.get("text_identity",[])),
+      "text_size_gate":{
+        "hard_pct":TEXT_SIZE_GATE_PCT,
+        "soft_min_pct":TEXT_SIZE_SOFT_MIN_PCT,
+        "soft_conf":TEXT_SIZE_SOFT_CONF,
+        "passed":sum(1 for x in profile.get("text_identity",[]) if x.get("size_gate_passed")),
+        "excluded":sum(1 for x in profile.get("text_identity",[]) if not x.get("size_gate_passed")),
+      },
     }
 
 # -------------------------- text / hangul --------------------------
@@ -1160,8 +1235,8 @@ async function ensureOcrWorker(){if(ocrWorker)return ocrWorker;$('ocrState').tex
 async function browserOcr(){const f=$('fullImg').files[0];if(!f)return[];const key=fileKey(f);if(ocrCache.fileKey===key&&ocrCache.items.length)return ocrCache.items;const w=await ensureOcrWorker();$('ocrState').textContent='한글+영문 실제 문자를 읽는 중…';const r=await w.recognize(f);const lines=(r.data.lines&&r.data.lines.length?r.data.lines:r.data.words)||[];const items=lines.filter(x=>x.text&&String(x.text).trim().length>1&&x.bbox).map(x=>({text:String(x.text).trim(),confidence:Number(x.confidence||0),bbox:{x0:x.bbox.x0,y0:x.bbox.y0,x1:x.bbox.x1,y1:x.bbox.y1}}));ocrCache={fileKey:key,items};$('ocrState').textContent=`OCR 완료 · ${items.length}개 문자영역`;return items}
 async function payload(){return{registration_name:$('regname').value.trim(),display_name:$('display').value.trim(),url:$('url').value.trim(),reference_image_base64:await file64($('fullImg').files[0]),detected_texts:await browserOcr()}}
 function paletteText(p){return(p?.dominant||[]).map(x=>`${x.family} ${x.percent}%`).join(' / ')}
-function identityHtml(rows){if(!rows?.length)return'<p class="warn">이미지 OCR Identity 없음 · 재등록 권장</p>';return rows.slice(0,20).map(r=>`<div class="identity"><b>${esc(r.text)}</b><span>${esc(r.script)} · ${esc(r.role)}</span><span>x ${r.position.x_pct}% / y ${r.position.y_pct}% / 가로 ${r.position.width_pct}% / 세로 ${r.position.height_pct}%<br>글자형태 ${esc(JSON.stringify(r.font_estimate?.top))}</span><span>${esc(paletteText(r.color))}</span></div>`).join('')}
-$('analyze').onclick=async()=>{if(!$('admin').value)return alert('관리자 키를 저장하세요.');const b=await payload();$('analysis').textContent='Visual Identity 분석 중…';const r=await fetch('/api/analyze_registration',{method:'POST',headers:{'Content-Type':'application/json','X-Admin-Key':$('admin').value},body:JSON.stringify(b)});const x=await r.json();if(!r.ok)return alert(JSON.stringify(x));const sm=x.summary;$('analysis').innerHTML=`<b>등록 힌트</b>: ${esc((sm.hint_tokens||[]).join(' / '))}<br><b>이미지 실제 OCR</b>: ${esc((sm.image_ocr_terms||[]).join(' | '))}<br><b>LIVE 후보어</b>: ${esc((sm.recognition_terms||[]).join(' | '))}<br><b>전체 색상</b>: ${esc(paletteText(sm.full_color))}<br><b>디자인 복잡도</b>: ${esc(sm.design?.visual_complexity_10)}/10 · <b>SIFT</b>: ${sm.sift_features}<br><br><b>TEXT IDENTITY</b>${identityHtml(sm.text_identity)}`;$('previews').innerHTML=(x.primary_preview?`<div>PRIMARY 시각밴드<br><img src="${x.primary_preview}"></div>`:'')+(x.secondary_preview?`<div>SECONDARY 시각밴드<br><img src="${x.secondary_preview}"></div>`:'')};
+function identityHtml(rows){if(!rows?.length)return'<p class="warn">이미지 OCR Identity 없음 · 재등록 권장</p>';return rows.slice(0,20).map(r=>`<div class="identity"><b>${esc(r.text)}</b><span>${esc(r.script)} · ${esc(r.role)}<br>${r.size_gate_passed?'✅ 통과':'❌ 제외'} · 높이 ${esc(r.height_pct)}%<br>${esc(r.size_gate_reason||'')}</span><span>x ${r.position.x_pct}% / y ${r.position.y_pct}% / 가로 ${r.position.width_pct}% / 세로 ${r.position.height_pct}%<br>글자형태 ${esc(JSON.stringify(r.font_estimate?.top))}</span><span>${esc(paletteText(r.color))}</span></div>`).join('')}
+$('analyze').onclick=async()=>{if(!$('admin').value)return alert('관리자 키를 저장하세요.');const b=await payload();$('analysis').textContent='Visual Identity 분석 중…';const r=await fetch('/api/analyze_registration',{method:'POST',headers:{'Content-Type':'application/json','X-Admin-Key':$('admin').value},body:JSON.stringify(b)});const x=await r.json();if(!r.ok)return alert(JSON.stringify(x));const sm=x.summary;$('analysis').innerHTML=`<b>등록 힌트</b>: ${esc((sm.hint_tokens||[]).join(' / '))}<br><b>이미지 실제 OCR</b>: ${esc((sm.image_ocr_terms||[]).join(' | '))}<br><b>LIVE 후보어</b>: ${esc((sm.recognition_terms||[]).join(' | '))}<br><b>전체 색상</b>: ${esc(paletteText(sm.full_color))}<br><b>디자인 복잡도</b>: ${esc(sm.design?.visual_complexity_10)}/10 · <b>SIFT</b>: ${sm.sift_features}<br><b>TEXT SIZE GATE</b>: ${esc(sm.text_size_gate?.hard_pct)}% 이상 기본 통과 / 통과 ${esc(sm.text_size_gate?.passed)} / 제외 ${esc(sm.text_size_gate?.excluded)}<br><br><b>TEXT IDENTITY</b>${identityHtml(sm.text_identity)}`;$('previews').innerHTML=(x.primary_preview?`<div>PRIMARY 시각밴드<br><img src="${x.primary_preview}"></div>`:'')+(x.secondary_preview?`<div>SECONDARY 시각밴드<br><img src="${x.secondary_preview}"></div>`:'')};
 $('f').onsubmit=async e=>{e.preventDefault();if(!$('admin').value)return alert('관리자 키를 저장하세요.');const b=await payload();const r=await fetch('/api/entries',{method:'POST',headers:{'Content-Type':'application/json','X-Admin-Key':$('admin').value},body:JSON.stringify(b)});const x=await r.json();if(!r.ok)return alert(JSON.stringify(x));alert('등록 완료');refresh()};
 async function refresh(){const h=await(await fetch('/health')).json();$('state').innerHTML=`<span class="ok">ONLINE</span> V${h.version} · ${h.entries}개`;const r=await fetch('/api/entries',{headers:ah()});if(!r.ok)return;const a=await r.json();let t='<table><tr><th>등록명</th><th>표시명</th><th>이미지 OCR</th><th>색/Visual</th><th>URL</th><th>관리</th></tr>';for(const x of a){const o=x.profile_summary?.image_ocr_terms||[];t+=`<tr><td><b>${esc(x.registration_name)}</b></td><td>${esc(x.display_name)}</td><td>${x.profile_summary?.ocr_ready?esc(o.slice(0,7).join(' / ')):'<span class="warn">OCR 미분석 · 재등록 권장</span>'}</td><td>${esc(paletteText(x.profile_summary?.color))}<br>SIFT ${esc(x.profile_summary?.sift_features||0)}</td><td><a href="${esc(x.url)}" target="_blank">열기</a></td><td><button onclick="showProfile(${x.id})">분석보기</button> <button class="danger" onclick="delx(${x.id})">삭제</button></td></tr>`}$('list').innerHTML=t+'</table>'}
 async function showProfile(id){const r=await fetch('/api/entries/'+id+'/profile',{headers:ah()});if(!r.ok)return alert('분석정보 조회 실패');const x=await r.json(),p=x.profile||{};$('modalTitle').textContent=`${x.registration_name} · 분석정보`;const ir=await fetch('/api/entries/'+id+'/reference-image',{headers:ah()});if(ir.ok){const u=URL.createObjectURL(await ir.blob());$('modalImage').innerHTML=`<div>등록 기준이미지<br><img src="${u}"></div>`}else $('modalImage').innerHTML='';$('modalBody').innerHTML=`<p><b>등록 힌트:</b> ${esc((p.context?.hint_tokens||[]).join(' / '))}</p><p><b>이미지 OCR:</b> ${esc((p.context?.image_ocr_terms||[]).join(' | '))}</p><p><b>전체 후보어:</b> ${esc((p.context?.recognition_terms||[]).join(' | '))}</p><p><b>색상:</b> ${esc(paletteText(p.full_visual?.color))} · <b>디자인:</b> ${esc(p.design?.visual_complexity_10)}/10</p>${identityHtml(p.text_identity||[])}<h4>Raw Identity Profile</h4><div class="profile">${esc(JSON.stringify(p,null,2))}</div>`;$('modal').style.display='block'}
@@ -1290,6 +1365,7 @@ def qr_fast_verify():
     x=request.get_json(silent=True) or {}
     candidate_ids=[int(v) for v in (x.get("candidate_ids") or [])[:3]]
     frame_raw=b64_bytes(x.get("image_base64"))
+    visual_only=bool(x.get("visual_only"))
     lat,lon=x.get("lat"),x.get("lon")
 
     if not candidate_ids or not frame_raw:
@@ -1316,12 +1392,36 @@ def qr_fast_verify():
         visual=float(sd.get("score",0.0))
         gok,dist=gps_ok(row,lat,lon)
 
-        strong=bool(
+        median_error=sd.get("median_error")
+        coverage=float(sd.get("coverage",0) or 0)
+        good_matches=int(sd.get("good_matches",0) or 0)
+        inliers=int(sd.get("inliers",0) or 0)
+        ratio=float(sd.get("inlier_ratio",0) or 0)
+
+        # Text-supported candidate can use a normal strong visual threshold.
+        text_supported=bool(
             sd.get("homography")
-            and sd.get("inliers",0)>=14
-            and sd.get("inlier_ratio",0)>=0.65
-            and visual>=78.0
+            and visual>=88.0
+            and good_matches>=22
+            and inliers>=18
+            and ratio>=0.70
+            and coverage>=0.12
+            and (median_error is None or median_error<=3.0)
         )
+
+        # No OCR/context evidence: demand near-identity geometry.
+        # This prevents a pizza from becoming an 83% "Winning Habit" false positive.
+        visual_only_supported=bool(
+            sd.get("homography")
+            and visual>=94.0
+            and good_matches>=35
+            and inliers>=28
+            and ratio>=0.78
+            and coverage>=0.22
+            and (median_error is None or median_error<=2.0)
+        )
+
+        strong=visual_only_supported if visual_only else text_supported
 
         f=row.fields()
         d={
@@ -1345,6 +1445,10 @@ def qr_fast_verify():
             "passed":bool(strong and gok),
             "final_confidence":round(visual,1),
             "fast_path":True,
+            "visual_only":visual_only,
+            "text_supported":text_supported,
+            "visual_only_supported":visual_only_supported,
+            "required_visual_score":94.0 if visual_only else 88.0,
         }
         diagnostics.append(d)
         if d["passed"]:
