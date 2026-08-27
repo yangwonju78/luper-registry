@@ -1,4 +1,5 @@
 import base64
+from functools import lru_cache
 import difflib
 import json
 import math
@@ -26,7 +27,7 @@ app.config["MAX_CONTENT_LENGTH"] = 15 * 1024 * 1024
 
 db = SQLAlchemy(app)
 ADMIN_KEY = os.getenv("ADMIN_KEY", "change-me")
-VERSION = "0.8.0"
+VERSION = "0.8.0.6"
 
 
 class Link(db.Model):
@@ -177,6 +178,7 @@ def analyze_registration_image(full_raw,registration_name,display_name):
         "color":color_profile(full_raw),
         "typography":typography_features(full_raw),
         "sift":sift_fingerprint(full_raw),
+        "multiview_sift":build_multiview_sift(full_raw),
         "variants":generate_variants(full_raw)
       },
       "mode":"CONTEXT_VISUAL"
@@ -503,6 +505,80 @@ def typography_similarity(a, b):
 
 
 
+
+def perspective_variant(raw,direction):
+    img=decode_color(raw)
+    if img is None:return raw
+    h,w=img.shape[:2]
+    if w<20 or h<20:return raw
+    k=max(4,int(min(w,h)*0.12))
+    src=np.float32([[0,0],[w-1,0],[w-1,h-1],[0,h-1]])
+    if direction=="up15":
+        dst=np.float32([[k,0],[w-1-k,0],[w-1,h-1],[0,h-1]])
+    elif direction=="down15":
+        dst=np.float32([[0,0],[w-1,0],[w-1-k,h-1],[k,h-1]])
+    elif direction=="left15":
+        dst=np.float32([[0,k],[w-1,0],[w-1,h-1],[0,h-1-k]])
+    elif direction=="right15":
+        dst=np.float32([[0,0],[w-1,k],[w-1,h-1-k],[0,h-1]])
+    else:
+        return raw
+    H=cv2.getPerspectiveTransform(src,dst)
+    warped=cv2.warpPerspective(img,H,(w,h),flags=cv2.INTER_LINEAR,borderMode=cv2.BORDER_REPLICATE)
+    ok,enc=cv2.imencode(".jpg",warped,[cv2.IMWRITE_JPEG_QUALITY,90])
+    return enc.tobytes() if ok else raw
+
+def build_multiview_sift(raw):
+    variants={
+        "front":raw,
+        "up15":perspective_variant(raw,"up15"),
+        "down15":perspective_variant(raw,"down15"),
+        "left15":perspective_variant(raw,"left15"),
+        "right15":perspective_variant(raw,"right15"),
+    }
+    return {k:sift_fingerprint(v) for k,v in variants.items() if v}
+
+def estimate_view_priority(frame_raw):
+    gray=decode_gray(frame_raw)
+    if gray is None:return ["front","left15","right15","up15","down15"]
+    gray,_=_resize_for_features(gray,420)
+    gx=cv2.Sobel(gray,cv2.CV_32F,1,0,ksize=3)
+    gy=cv2.Sobel(gray,cv2.CV_32F,0,1,ksize=3)
+    h,w=gray.shape[:2]
+    left=float(np.mean(np.abs(gx[:,:max(1,w//3)])))
+    right=float(np.mean(np.abs(gx[:,max(0,2*w//3):])))
+    top=float(np.mean(np.abs(gy[:max(1,h//3),:])))
+    bottom=float(np.mean(np.abs(gy[max(0,2*h//3):,:])))
+    h1="left15" if left>right else "right15"
+    h2="right15" if h1=="left15" else "left15"
+    v1="up15" if top>bottom else "down15"
+    v2="down15" if v1=="up15" else "up15"
+    return ["front",h1,v1,h2,v2]
+
+def multiview_sift_score(multiview_fp,frame_raw):
+    priority=estimate_view_priority(frame_raw)
+    best=None
+    tested=0
+    for view in priority:
+        fp=multiview_fp.get(view)
+        if not fp:continue
+        tested+=1
+        d=sift_homography_score_from_fp(fp,frame_raw)
+        d["view"]=view
+        d["tested_views"]=tested
+        if best is None or d.get("score",0)>best.get("score",0):
+            best=d
+        if d.get("score",0)>=90 and d.get("inliers",0)>=24 and d.get("inlier_ratio",0)>=0.75:
+            d["early_stop"]=True
+            return d
+        if tested>=3 and best and best.get("score",0)>=78:
+            break
+    if best is None:
+        best={"score":0.0,"view":"none","good_matches":0,"inliers":0,"inlier_ratio":0.0,"median_error":None,"coverage":0.0,"homography":False}
+    best["tested_views"]=tested
+    best["early_stop"]=False
+    return best
+
 # -------------------------- SIFT / Homography Visual Fingerprint --------------------------
 
 def _resize_for_features(gray, max_side=900):
@@ -553,18 +629,22 @@ def sift_fingerprint(raw):
     }
 
 
-def _load_sift_fingerprint(fp):
-    if not fp or not fp.get("npz_b64"):
-        return None
-    try:
-        import io
-        raw = base64.b64decode(fp["npz_b64"])
-        data = np.load(io.BytesIO(raw))
+@lru_cache(maxsize=512)
+def _load_sift_npz_cached(npz_b64):
+    import io
+    raw = base64.b64decode(npz_b64)
+    with np.load(io.BytesIO(raw)) as data:
         return {
             "descriptors": data["descriptors"].astype(np.float32),
             "points": data["points"].astype(np.float32),
             "shape": tuple(int(v) for v in data["shape"]),
         }
+
+def _load_sift_fingerprint(fp):
+    if not fp or not fp.get("npz_b64"):
+        return None
+    try:
+        return _load_sift_npz_cached(fp["npz_b64"])
     except Exception:
         return None
 
@@ -578,8 +658,8 @@ def sift_homography_score_from_fp(fp, frame_raw):
             "median_error": None, "coverage": 0.0, "homography": False
         }
 
-    frame, _ = _resize_for_features(frame, 900)
-    sift = cv2.SIFT_create(nfeatures=1600, contrastThreshold=0.025, edgeThreshold=12, sigma=1.6)
+    frame, _ = _resize_for_features(frame, 720)
+    sift = cv2.SIFT_create(nfeatures=1000, contrastThreshold=0.028, edgeThreshold=12, sigma=1.6)
     k2, d2 = sift.detectAndCompute(frame, None)
     d1 = ref["descriptors"]
     pts1 = ref["points"]
@@ -1033,68 +1113,109 @@ def fast_verify():
     started = datetime.now(timezone.utc)
     x = request.get_json(silent=True) or {}
     candidate_ids = [int(v) for v in (x.get("candidate_ids") or [])[:3]]
-    frame_raw = b64_bytes(x.get("image_base64"))
-    lat, lon = x.get("lat"), x.get("lon")
 
-    if not candidate_ids or not frame_raw or decode_gray(frame_raw) is None:
+    frame_items = x.get("frames") or []
+    frame_raws = []
+    for item in frame_items[:3]:
+        if isinstance(item, dict):
+            raw = b64_bytes(item.get("image_base64"))
+        else:
+            raw = b64_bytes(item)
+        if raw:
+            frame_raws.append(raw)
+
+    # backward compatibility
+    if not frame_raws:
+        single = b64_bytes(x.get("image_base64"))
+        if single:
+            frame_raws=[single]
+
+    lat, lon = x.get("lat"), x.get("lon")
+    if not candidate_ids or not frame_raws:
         return jsonify(matches=[], diagnostics=[], elapsed_ms=0, version=VERSION)
 
-    matches = []
-    diagnostics = []
+    matches=[]
+    diagnostics=[]
 
     for cid in candidate_ids:
-        row = db.session.get(Link, cid)
+        row=db.session.get(Link,cid)
         if not row or not row.enabled:
             continue
 
-        # SIFT fingerprint only. No typography, no ORB, no shape unless SIFT is weak.
         try:
-            p = json.loads(row.identity_profile or "{}")
+            p=json.loads(row.identity_profile or "{}")
         except Exception:
-            p = {}
-        fp = p.get("full_visual", {}).get("sift", {})
-        if not fp:
-            fp = sift_fingerprint(row.reference_image)
+            p={}
+        mv=p.get("full_visual",{}).get("multiview_sift",{})
+        if not mv:
+            mv=build_multiview_sift(row.reference_image)
 
-        sd = sift_homography_score_from_fp(fp, frame_raw)
-        visual = float(sd.get("score", 0.0))
-        gok, dist = gps_ok(row, lat, lon)
+        best=None
+        frames_tested=0
+        for fi,frame_raw in enumerate(frame_raws):
+            frames_tested += 1
+            sd=multiview_sift_score(mv,frame_raw)
+            sd["burst_frame"]=fi+1
+            if best is None or sd.get("score",0)>best.get("score",0):
+                best=sd
 
-        strong = bool(
+            # First-exposure fast stop:
+            # one frame with very strong geometry is enough.
+            if (
+                sd.get("score",0)>=90.0
+                and sd.get("inliers",0)>=24
+                and sd.get("inlier_ratio",0)>=0.75
+            ):
+                sd["burst_early_stop"]=True
+                best=sd
+                break
+
+        sd=best or {}
+        visual=float(sd.get("score",0.0))
+        gok,dist=gps_ok(row,lat,lon)
+
+        strong=bool(
             sd.get("homography")
-            and sd.get("inliers", 0) >= 18
-            and sd.get("inlier_ratio", 0) >= 0.68
-            and visual >= 82.0
+            and sd.get("inliers",0)>=18
+            and sd.get("inlier_ratio",0)>=0.68
+            and visual>=80.0
         )
 
-        f = row.fields()
-        d = {
-            "id": row.id,
-            "registration_name": f["registration_name"],
-            "display_name": f["display_name"],
-            "major_category": f["major_category"],
-            "minor_category": f["minor_category"],
-            "url": row.url,
-            "visual_method": "SIFT_FAST_ONLY",
-            "visual_score": round(visual, 1),
-            "sift_good_matches": sd.get("good_matches", 0),
-            "sift_inliers": sd.get("inliers", 0),
-            "sift_inlier_ratio": sd.get("inlier_ratio", 0),
-            "sift_median_error": sd.get("median_error"),
-            "sift_coverage": sd.get("coverage", 0),
-            "gps_ok": gok,
-            "distance_m": dist,
-            "passed": bool(strong and gok),
-            "final_confidence": round(visual, 1),
-            "fast_path": True,
+        f=row.fields()
+        d={
+            "id":row.id,
+            "registration_name":f["registration_name"],
+            "display_name":f["display_name"],
+            "major_category":f["major_category"],
+            "minor_category":f["minor_category"],
+            "url":row.url,
+            "visual_method":"MULTIVIEW_BURST_SIFT",
+            "matched_view":sd.get("view","front"),
+            "tested_views":sd.get("tested_views",0),
+            "early_stop":sd.get("early_stop",False),
+            "burst_frame":sd.get("burst_frame",1),
+            "burst_frames_tested":frames_tested,
+            "burst_early_stop":sd.get("burst_early_stop",False),
+            "visual_score":round(visual,1),
+            "sift_good_matches":sd.get("good_matches",0),
+            "sift_inliers":sd.get("inliers",0),
+            "sift_inlier_ratio":sd.get("inlier_ratio",0),
+            "sift_median_error":sd.get("median_error"),
+            "sift_coverage":sd.get("coverage",0),
+            "gps_ok":gok,
+            "distance_m":dist,
+            "passed":bool(strong and gok),
+            "final_confidence":round(visual,1),
+            "fast_path":True,
         }
         diagnostics.append(d)
         if d["passed"]:
             matches.append(d)
 
-    matches.sort(key=lambda q: q["visual_score"], reverse=True)
-    elapsed = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
-    return jsonify(matches=matches, diagnostics=diagnostics, elapsed_ms=elapsed, version=VERSION)
+    matches.sort(key=lambda q:q["visual_score"],reverse=True)
+    elapsed=int((datetime.now(timezone.utc)-started).total_seconds()*1000)
+    return jsonify(matches=matches,diagnostics=diagnostics,elapsed_ms=elapsed,version=VERSION)
+
 
 @app.post("/api/verify")
 def verify():
@@ -1326,7 +1447,8 @@ def migrate():
             current = {}
         needs_rebuild = (
             not current or current.get("profile_version")!="3.0" or
-            not current.get("full_visual", {}).get("sift", {}).get("npz_b64")
+            not current.get("full_visual", {}).get("sift", {}).get("npz_b64") or
+            not current.get("full_visual", {}).get("multiview_sift")
         )
         if needs_rebuild:
             try:
