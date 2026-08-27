@@ -1,4 +1,5 @@
 import base64
+import time
 from functools import lru_cache
 import difflib
 import json
@@ -27,7 +28,7 @@ app.config["MAX_CONTENT_LENGTH"] = 15 * 1024 * 1024
 
 db = SQLAlchemy(app)
 ADMIN_KEY = os.getenv("ADMIN_KEY", "change-me")
-VERSION = "0.8.0.6"
+VERSION = "0.8.0.7"
 
 
 class Link(db.Model):
@@ -658,8 +659,8 @@ def sift_homography_score_from_fp(fp, frame_raw):
             "median_error": None, "coverage": 0.0, "homography": False
         }
 
-    frame, _ = _resize_for_features(frame, 720)
-    sift = cv2.SIFT_create(nfeatures=1000, contrastThreshold=0.028, edgeThreshold=12, sigma=1.6)
+    frame, _ = _resize_for_features(frame, 520)
+    sift = cv2.SIFT_create(nfeatures=650, contrastThreshold=0.03, edgeThreshold=12, sigma=1.6)
     k2, d2 = sift.detectAndCompute(frame, None)
     d1 = ref["descriptors"]
     pts1 = ref["points"]
@@ -1106,6 +1107,79 @@ def candidates():
     out.sort(key=lambda q: (q["text_score"], q["priority"]), reverse=True)
     return jsonify(candidates=out[:8], version=VERSION)
 
+
+
+
+@app.post("/api/qr_fast_verify")
+def qr_fast_verify():
+    started=time.perf_counter()
+    x=request.get_json(silent=True) or {}
+    candidate_ids=[int(v) for v in (x.get("candidate_ids") or [])[:3]]
+    frame_raw=b64_bytes(x.get("image_base64"))
+    lat,lon=x.get("lat"),x.get("lon")
+
+    if not candidate_ids or not frame_raw:
+        return jsonify(matches=[],diagnostics=[],elapsed_ms=0,version=VERSION)
+
+    matches=[]
+    diagnostics=[]
+
+    for cid in candidate_ids:
+        row=db.session.get(Link,cid)
+        if not row or not row.enabled:
+            continue
+
+        try:
+            p=json.loads(row.identity_profile or "{}")
+        except Exception:
+            p={}
+
+        fp=p.get("full_visual",{}).get("sift",{})
+        if not fp:
+            fp=sift_fingerprint(row.reference_image)
+
+        sd=sift_homography_score_from_fp(fp,frame_raw)
+        visual=float(sd.get("score",0.0))
+        gok,dist=gps_ok(row,lat,lon)
+
+        strong=bool(
+            sd.get("homography")
+            and sd.get("inliers",0)>=14
+            and sd.get("inlier_ratio",0)>=0.65
+            and visual>=78.0
+        )
+
+        f=row.fields()
+        d={
+            "id":row.id,
+            "registration_name":f["registration_name"],
+            "display_name":f["display_name"],
+            "url":row.url,
+            "visual_method":"FRONT_SIFT_QR_FAST",
+            "matched_view":"front",
+            "tested_views":1,
+            "burst_frame":x.get("selected_frame",1),
+            "burst_frames_tested":1,
+            "visual_score":round(visual,1),
+            "sift_good_matches":sd.get("good_matches",0),
+            "sift_inliers":sd.get("inliers",0),
+            "sift_inlier_ratio":sd.get("inlier_ratio",0),
+            "sift_median_error":sd.get("median_error"),
+            "sift_coverage":sd.get("coverage",0),
+            "gps_ok":gok,
+            "distance_m":dist,
+            "passed":bool(strong and gok),
+            "final_confidence":round(visual,1),
+            "fast_path":True,
+        }
+        diagnostics.append(d)
+        if d["passed"]:
+            matches.append(d)
+            break
+
+    matches.sort(key=lambda q:q["visual_score"],reverse=True)
+    elapsed=int((time.perf_counter()-started)*1000)
+    return jsonify(matches=matches,diagnostics=diagnostics,elapsed_ms=elapsed,version=VERSION)
 
 
 @app.post("/api/fast_verify")
