@@ -28,7 +28,7 @@ app.config["MAX_CONTENT_LENGTH"] = 15 * 1024 * 1024
 
 db = SQLAlchemy(app)
 ADMIN_KEY = os.getenv("ADMIN_KEY", "change-me")
-VERSION = "0.8.1.5"
+VERSION = "0.8.1.6"
 
 
 class Link(db.Model):
@@ -1824,12 +1824,11 @@ def visual_candidates():
 
 @app.post("/api/hybrid_verify")
 def hybrid_verify():
-    """
-    Hybrid decision:
-    - embedding candidates are already ranked
-    - text_support is supplied by the app for each candidate
-    - strong embedding + strong text can pass without SIFT
-    - otherwise run prepared SIFT only for ambiguous candidates
+    """V0.8.1.6 stable hybrid verification.
+
+    Embedding is candidate retrieval evidence only. It never vetoes a geometrically
+    strong SIFT match. Weak pseudo-embedding candidates are not allowed to trigger
+    expensive SIFT unless text independently supports them.
     """
     started=time.perf_counter()
     x=request.get_json(silent=True) or {}
@@ -1841,7 +1840,7 @@ def hybrid_verify():
 
     matches=[]
     diagnostics=[]
-    ambiguous=[]
+    prepared=[]
     for item in items[:6]:
         try: cid=int(item.get("id"))
         except Exception: continue
@@ -1849,40 +1848,28 @@ def hybrid_verify():
         if not row or not row.enabled: continue
         emb=float(item.get("embedding_score",0) or 0)
         text=float(item.get("text_score",0) or 0)
+        source=str(item.get("candidate_source") or "UNKNOWN")
+        # Defense in depth: don't SIFT random low-score embedding neighbors.
+        if emb < 35.0 and text < 38.0:
+            continue
         gok,dist=gps_ok(row,lat,lon)
         f=row.fields()
-
-        # High-confidence shortcut.
-        # Text may be imperfect; visual embedding must still be strong.
-        direct=bool(gok and emb>=91.0 and text>=82.0)
-
         d={
-            "id":row.id,
-            "registration_name":f["registration_name"],
-            "display_name":f["display_name"],
+            "id":row.id,"registration_name":f["registration_name"],"display_name":f["display_name"],
             "links":[
                 {"title":row.link_title_1 or "열기","url":row.link_url_1 or row.url},
                 *([{"title":row.link_title_2,"url":row.link_url_2}] if row.link_url_2 else []),
                 *([{"title":row.link_title_3,"url":row.link_url_3}] if row.link_url_3 else []),
             ],
-            "url":row.link_url_1 or row.url,
-            "embedding_score":round(emb,1),
-            "text_score":round(text,1),
-            "gps_ok":gok,
-            "distance_m":dist,
-            "decision":"EMBED_TEXT_DIRECT" if direct else "NEEDS_SIFT",
-            "passed":direct,
-            "final_confidence":round(min(99.0,emb*0.62+text*0.38),1) if direct else 0.0,
+            "url":row.link_url_1 or row.url,"embedding_score":round(emb,1),"text_score":round(text,1),
+            "candidate_source":source,"gps_ok":gok,"distance_m":dist,"decision":"NEEDS_SIFT",
+            "passed":False,"final_confidence":0.0,
         }
-        if direct:
-            matches.append(d)
-            diagnostics.append(d)
-        else:
-            ambiguous.append((row,d))
+        prepared.append((row,d))
 
-    if ambiguous:
+    if prepared:
         live_sift=prepare_live_sift(raw)
-        for row,d in ambiguous:
+        for row,d in prepared:
             try:p=json.loads(row.identity_profile or "{}")
             except Exception:p={}
             fp=p.get("full_visual",{}).get("sift",{})
@@ -1890,34 +1877,28 @@ def hybrid_verify():
             sd=sift_homography_score_prepared(fp,live_sift)
             visual=float(sd.get("score",0) or 0)
             text=float(d["text_score"])
-            emb=float(d["embedding_score"])
 
-            # Dynamic threshold:
-            # strong text lowers required SIFT; weak text requires stronger SIFT.
-            if text>=88: required=78.0
-            elif text>=72: required=84.0
+            # Text assists thresholding; embedding does NOT participate in PASS/FAIL.
+            if text>=88: required=76.0
+            elif text>=72: required=82.0
+            elif text>=38: required=88.0
             else: required=92.0
-
-            geometry_ok=bool(
-                sd.get("homography")
-                and int(sd.get("inliers",0) or 0)>=16
-                and float(sd.get("inlier_ratio",0) or 0)>=0.62
-                and float(sd.get("coverage",0) or 0)>=0.10
-            )
-            passed=bool(d["gps_ok"] and geometry_ok and visual>=required and emb>=58.0)
-            final=visual*0.50+emb*0.28+text*0.22
-
+            inliers=int(sd.get("inliers",0) or 0)
+            ratio=float(sd.get("inlier_ratio",0) or 0)
+            coverage=float(sd.get("coverage",0) or 0)
+            geometry_ok=bool(sd.get("homography") and inliers>=16 and ratio>=0.62 and coverage>=0.10)
+            passed=bool(d["gps_ok"] and geometry_ok and visual>=required)
+            # Confidence is based on final evidence only; embedding remains diagnostic.
+            final=visual if text<38 else visual*0.82+text*0.18
+            reason=("SIFT_GEOMETRY_PASS" if passed else
+                    "GPS_REJECT" if not d["gps_ok"] else
+                    "SIFT_GEOMETRY_REJECT" if not geometry_ok else "SIFT_SCORE_REJECT")
             d.update({
-                "decision":"SIFT_FALLBACK",
-                "visual_score":round(visual,1),
-                "required_visual_score":required,
-                "sift_good_matches":sd.get("good_matches",0),
-                "sift_inliers":sd.get("inliers",0),
-                "sift_inlier_ratio":sd.get("inlier_ratio",0),
-                "sift_coverage":sd.get("coverage",0),
-                "sift_median_error":sd.get("median_error"),
-                "passed":passed,
-                "final_confidence":round(final,1),
+                "decision":"SIFT_FINAL","decision_reason":reason,"visual_score":round(visual,1),
+                "required_visual_score":required,"sift_good_matches":sd.get("good_matches",0),
+                "sift_inliers":inliers,"sift_inlier_ratio":ratio,"sift_coverage":coverage,
+                "sift_median_error":sd.get("median_error"),"passed":passed,
+                "final_confidence":round(min(99.0,final),1),
             })
             diagnostics.append(d)
             if passed: matches.append(d)
