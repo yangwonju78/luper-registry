@@ -28,7 +28,7 @@ app.config["MAX_CONTENT_LENGTH"] = 15 * 1024 * 1024
 
 db = SQLAlchemy(app)
 ADMIN_KEY = os.getenv("ADMIN_KEY", "change-me")
-VERSION = "0.8.0.7"
+VERSION = "0.8.0.9"
 
 
 class Link(db.Model):
@@ -98,10 +98,13 @@ class Link(db.Model):
             "profile_summary": {
                 "mode": profile.get("mode"),
                 "hint_tokens": profile.get("context", {}).get("hint_tokens", []),
-                "primary_typography": profile.get("regions", {}).get("primary", {}).get("typography", {}).get("font_family_probabilities", {}),
-                "secondary_typography": profile.get("regions", {}).get("secondary", {}).get("typography", {}).get("font_family_probabilities", {}),
+                "image_ocr_terms": profile.get("context", {}).get("image_ocr_terms", []),
+                "recognition_terms": profile.get("context", {}).get("recognition_terms", []),
                 "color": profile.get("full_visual", {}).get("color", {}),
+                "design": profile.get("design", {}),
+                "text_count": len(profile.get("text_identity", [])),
                 "sift_features": profile.get("full_visual", {}).get("sift", {}).get("count", 0),
+                "ocr_ready": bool(profile.get("text_identity", [])),
             },
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
@@ -159,49 +162,187 @@ def region_profile(raw):
     if not raw:return {}
     return {"typography":typography_features(raw),"color":color_profile(raw),"sift":sift_fingerprint(raw)}
 
-def analyze_registration_image(full_raw,registration_name,display_name):
+
+def _safe_bbox(item):
+    b=(item or {}).get("bbox") or {}
+    try:
+        x0=max(0,int(b.get("x0",0))); y0=max(0,int(b.get("y0",0)))
+        x1=max(x0+1,int(b.get("x1",0))); y1=max(y0+1,int(b.get("y1",0)))
+        return x0,y0,x1,y1
+    except Exception:
+        return None
+
+def normalize_detected_texts(items):
+    out=[]
+    for item in items or []:
+        text=str((item or {}).get("text","")).strip()
+        if len(norm(text))<2: continue
+        box=_safe_bbox(item)
+        if not box: continue
+        out.append({
+            "text":text,
+            "confidence":round(float((item or {}).get("confidence",0) or 0),1),
+            "bbox":{"x0":box[0],"y0":box[1],"x1":box[2],"y1":box[3]},
+        })
+    return out[:80]
+
+def detected_text_terms(items):
+    rows=normalize_detected_texts(items)
+    terms=[r["text"] for r in rows if r["text"]]
+    ordered=sorted(rows,key=lambda r:(r["bbox"]["y0"],r["bbox"]["x0"]))
+    for a,b in zip(ordered,ordered[1:]):
+        ah=max(1,a["bbox"]["y1"]-a["bbox"]["y0"])
+        bh=max(1,b["bbox"]["y1"]-b["bbox"]["y0"])
+        gap=b["bbox"]["y0"]-a["bbox"]["y1"]
+        overlap=max(0,min(a["bbox"]["x1"],b["bbox"]["x1"])-max(a["bbox"]["x0"],b["bbox"]["x0"]))
+        minw=max(1,min(a["bbox"]["x1"]-a["bbox"]["x0"],b["bbox"]["x1"]-b["bbox"]["x0"]))
+        if gap<=max(ah,bh)*1.2 and overlap/minw>=0.25:
+            terms.extend([a["text"]+" "+b["text"],a["text"]+b["text"]])
+    return list(dict.fromkeys(t for t in terms if len(norm(t))>=2))
+
+def script_type(text):
+    h=sum(1 for c in text if "가"<=c<="힣")
+    e=sum(1 for c in text if "a"<=c.lower()<="z")
+    n=sum(1 for c in text if c.isdigit())
+    if h and e:return "한글+영문"
+    if h:return "한글"
+    if e:return "영문"
+    if n:return "숫자"
+    return "기타"
+
+def crop_raw_bbox(raw,bbox,pad=4):
+    img=decode_color(raw)
+    if img is None:return None
+    h,w=img.shape[:2]
+    x0,y0,x1,y1=bbox
+    x0=max(0,x0-pad); y0=max(0,y0-pad); x1=min(w,x1+pad); y1=min(h,y1+pad)
+    if x1<=x0 or y1<=y0:return None
+    crop=img[y0:y1,x0:x1]
+    ok,enc=cv2.imencode(".jpg",crop,[cv2.IMWRITE_JPEG_QUALITY,88])
+    return enc.tobytes() if ok else None
+
+def palette_profile(raw):
+    img=decode_color(raw)
+    if img is None:return {}
+    img=cv2.resize(img,(120,120),interpolation=cv2.INTER_AREA)
+    hsv=cv2.cvtColor(img,cv2.COLOR_BGR2HSV)
+    H,S,V=hsv[:,:,0],hsv[:,:,1],hsv[:,:,2]
+    chroma=(S>40)&(V>=58)
+    red=chroma&((H<10)|(H>=170))
+    masks={
+      "화이트":(V>=205)&(S<=45),
+      "블랙":V<58,
+      "회색":(V>=58)&(V<205)&(S<=40),
+      "버건디":red&(V<145),
+      "레드":red&(V>=145),
+      "주황":chroma&(H>=10)&(H<25),
+      "노랑":chroma&(H>=25)&(H<40),
+      "초록":chroma&(H>=40)&(H<85),
+      "파랑":chroma&(H>=85)&(H<130),
+      "보라":chroma&(H>=130)&(H<170),
+    }
+    total=float(img.shape[0]*img.shape[1])
+    items=[]
+    for name,mask in masks.items():
+        pct=float(np.count_nonzero(mask))/total*100.0
+        if pct>=0.2: items.append({"family":name,"percent":round(pct,1)})
+    items.sort(key=lambda x:x["percent"],reverse=True)
+    return {"dominant":items[:6]}
+
+def region_identity_profiles(full_raw,detected):
+    img=decode_color(full_raw)
+    if img is None:return []
+    H,W=img.shape[:2]
+    out=[]
+    for r in normalize_detected_texts(detected):
+        b=r["bbox"];box=(b["x0"],b["y0"],b["x1"],b["y1"])
+        cw=max(1,box[2]-box[0]);ch=max(1,box[3]-box[1])
+        wr=cw/max(1,W);hr=ch/max(1,H);area=wr*hr
+        crop=crop_raw_bbox(full_raw,box,4)
+        typ=typography_features(crop) if crop else {}
+        col=palette_profile(crop) if crop else {}
+        importance=min(100.0,hr*540+wr*28+area*180+r["confidence"]*0.10)
+        role="PRIMARY" if importance>=55 else ("SECONDARY" if importance>=27 else "DETAIL")
+        fam=typ.get("font_family_probabilities",{})
+        top_font=max(fam.items(),key=lambda kv:kv[1]) if fam else None
+        out.append({
+          "text":r["text"],"script":script_type(r["text"]),"confidence":r["confidence"],
+          "role":role,"importance":round(importance,1),
+          "position":{
+            "x_pct":round(box[0]/max(1,W)*100,1),
+            "y_pct":round(box[1]/max(1,H)*100,1),
+            "width_pct":round(wr*100,1),
+            "height_pct":round(hr*100,1),
+          },
+          "font_estimate":{"top":top_font,"probabilities":fam},
+          "color":col,
+        })
+    out.sort(key=lambda q:(0 if q["role"]=="PRIMARY" else 1 if q["role"]=="SECONDARY" else 2,-q["importance"]))
+    return out
+
+def image_design_profile(raw,regions):
+    img=decode_gray(raw)
+    if img is None:return {}
+    small=cv2.resize(img,(160,160),interpolation=cv2.INTER_AREA)
+    edge_density=float(np.mean(cv2.Canny(small,60,150)>0))
+    palette=palette_profile(raw)
+    complexity=min(10.0,edge_density*50+max(0,len(palette.get("dominant",[]))-2)*0.45)
+    return {
+      "palette":palette,
+      "visual_complexity_10":round(complexity,1),
+      "primary_text_count":sum(1 for r in regions if r.get("role")=="PRIMARY"),
+      "secondary_text_count":sum(1 for r in regions if r.get("role")=="SECONDARY"),
+      "text_region_count":len(regions),
+    }
+
+def analyze_registration_image(full_raw,registration_name,display_name,detected_texts=None):
+    detected=normalize_detected_texts(detected_texts or [])
+    text_identity=region_identity_profiles(full_raw,detected)
     primary_raw,secondary_raw=detect_text_bands(full_raw)
+
+    context_base=context_recognition_terms(registration_name,display_name)
+    image_terms=detected_text_terms(detected)
+    recognition_terms=list(dict.fromkeys(context_base+image_terms))
+
     p={
-      "profile_version":"3.0",
-      "source":"IMAGE_AUTO_ANALYSIS",
+      "profile_version":"4.0",
+      "source":"BROWSER_OCR_PLUS_VISUAL_IDENTITY",
       "context":{
         "registration_name":registration_name,
         "display_name":display_name,
         "hint_tokens":context_tokens(registration_name,display_name),
-        "recognition_terms":context_recognition_terms(registration_name,display_name),
-        "note":"Context is a retrieval hint, not proof of image text."
+        "image_ocr_terms":image_terms,
+        "recognition_terms":recognition_terms,
+        "note":"등록명/표시명은 힌트, image_ocr_terms는 등록 이미지에서 실제 검출한 문자."
       },
+      "text_identity":text_identity,
       "regions":{
         "primary":region_profile(primary_raw) if primary_raw else {},
         "secondary":region_profile(secondary_raw) if secondary_raw else {}
       },
+      "design":image_design_profile(full_raw,text_identity),
       "full_visual":{
-        "color":color_profile(full_raw),
+        "color":palette_profile(full_raw),
         "typography":typography_features(full_raw),
         "sift":sift_fingerprint(full_raw),
         "multiview_sift":build_multiview_sift(full_raw),
         "variants":generate_variants(full_raw)
       },
-      "mode":"CONTEXT_VISUAL"
+      "mode":"OCR_LAYOUT_VISUAL"
     }
     return p,primary_raw,secondary_raw
 
 def registration_analysis_summary(profile):
-    def top(region):
-        probs=(region or {}).get("typography",{}).get("font_family_probabilities",{})
-        return max(probs.items(),key=lambda kv:kv[1]) if probs else None
-    p=profile.get("regions",{}).get("primary",{})
-    q=profile.get("regions",{}).get("secondary",{})
     return {
       "mode":profile.get("mode"),
       "hint_tokens":profile.get("context",{}).get("hint_tokens",[]),
+      "image_ocr_terms":profile.get("context",{}).get("image_ocr_terms",[]),
       "recognition_terms":profile.get("context",{}).get("recognition_terms",[]),
-      "primary_detected":bool(p),
-      "secondary_detected":bool(q),
-      "primary_font_top":top(p),
-      "secondary_font_top":top(q),
+      "text_identity":profile.get("text_identity",[])[:20],
+      "design":profile.get("design",{}),
       "full_color":profile.get("full_visual",{}).get("color",{}),
       "sift_features":profile.get("full_visual",{}).get("sift",{}).get("count",0),
+      "ocr_ready":bool(profile.get("text_identity",[])),
     }
 
 # -------------------------- text / hangul --------------------------
@@ -986,34 +1127,49 @@ def candidate_score(ocr_texts,row):
 
 # -------------------------- routes --------------------------
 
-INDEX_HTML = r"""<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>LUPER Registry V0.8.0</title><style>
-body{font-family:system-ui;background:#f5f6f8;margin:0}.w{max-width:1100px;margin:22px auto;padding:0 15px}.c{background:#fff;border:1px solid #ddd;border-radius:14px;padding:18px;margin:13px 0}.g{display:grid;grid-template-columns:1fr 1fr;gap:12px}.full{grid-column:1/-1}label{display:block;font-size:13px;color:#555;margin-bottom:5px}input{width:100%;box-sizing:border-box;padding:10px;border:1px solid #ccd1d7;border-radius:8px}button{border:0;border-radius:8px;background:#111;color:#fff;font-weight:700;padding:10px 13px}.muted{font-size:13px;color:#666}.profile{white-space:pre-wrap;font:12px/1.5 monospace;background:#101114;color:#eee;padding:10px;border-radius:8px}.preview{display:flex;gap:12px;flex-wrap:wrap}.preview img{max-width:320px;max-height:170px;border:1px solid #ddd;border-radius:8px}table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:8px;border-bottom:1px solid #eee;text-align:left}@media(max-width:820px){.g{grid-template-columns:1fr}.full{grid-column:auto}}
+INDEX_HTML = r"""<!doctype html>
+<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>LUPER Registry V0.8.0.9</title>
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+<style>
+body{font-family:system-ui,-apple-system,sans-serif;background:#f5f6f8;margin:0;color:#17191c}.w{max-width:1180px;margin:22px auto;padding:0 15px}.c{background:#fff;border:1px solid #ddd;border-radius:14px;padding:18px;margin:13px 0}.g{display:grid;grid-template-columns:1fr 1fr;gap:12px}.full{grid-column:1/-1}label{display:block;font-size:13px;color:#555;margin-bottom:5px}input{width:100%;box-sizing:border-box;padding:10px;border:1px solid #ccd1d7;border-radius:8px}button{border:0;border-radius:8px;background:#111;color:#fff;font-weight:700;padding:9px 12px;cursor:pointer}.danger{background:#a51d27}.ghost{background:#555}.muted{font-size:13px;color:#666}.ok{color:#18723a;font-weight:700}.warn{color:#a22;font-weight:700}table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:8px;border-bottom:1px solid #eee;text-align:left;vertical-align:top}.profile{white-space:pre-wrap;font:12px/1.55 ui-monospace,monospace;background:#101114;color:#eee;padding:11px;border-radius:8px;max-height:420px;overflow:auto}.preview{display:flex;gap:12px;flex-wrap:wrap}.preview img{max-width:330px;max-height:210px;border:1px solid #ddd;border-radius:8px}.identity{display:grid;grid-template-columns:135px 100px 1fr 180px;gap:5px;font-size:12px;border-bottom:1px solid #eee;padding:7px 0}.modal{display:none;position:fixed;inset:0;background:#0008;z-index:30;padding:30px;overflow:auto}.modalbox{max-width:1050px;margin:auto;background:#fff;border-radius:14px;padding:18px}@media(max-width:820px){.g{grid-template-columns:1fr}.full{grid-column:auto}.identity{grid-template-columns:1fr}table{display:block;overflow:auto}}
 </style></head><body><div class="w">
-<h2>LUPER Registry V0.8.0</h2><p><b>Context Hint + Image Identity Profile</b></p>
-<p class="muted">사용자는 등록명·표시명·URL·이미지만 제공합니다. 등록명과 표시명은 후보 검색을 돕는 힌트이고, 이미지의 시각 구조와 SIFT 특징은 원본에서 자동 생성합니다.</p>
+<h2>LUPER Registry V0.8.0.9</h2>
+<p><b>Context Hint + 실제 이미지 OCR + Layout/Color + SIFT</b></p>
+<p class="muted">등록명·표시명은 힌트입니다. 등록 이미지에서 한글+영문을 실제로 읽어 Winning Habit 같은 문구도 후보어로 저장합니다.</p>
 <div class="c"><label>관리자 키</label><div style="display:flex;gap:8px"><input id="admin" type="password"><button id="saveKey">키 저장</button></div></div>
 <div class="c"><form id="f"><div class="g">
-<div><label>등록명 · 분석 힌트</label><input id="regname" required placeholder="살만온족발 로고 / 비스포크 냉장고 2026"></div>
-<div><label>표시명 · 링크카드 표시</label><input id="display" required placeholder="살만온족발 메뉴"></div>
+<div><label>등록명 · 분석 힌트</label><input id="regname" required placeholder="이기는 습관 샘앤파커스"></div>
+<div><label>표시명 · 링크카드 표시</label><input id="display" required placeholder="이기는 습관"></div>
 <div class="full"><label>URL</label><input id="url" required placeholder="https://..."></div>
 <div class="full"><label>기준 이미지</label><input id="fullImg" type="file" accept="image/*" required></div>
-<div class="full" style="display:flex;gap:8px"><button type="button" id="analyze">이미지 사전분석</button><button type="submit">등록</button></div>
+<div class="full"><div id="ocrState" class="muted">사전분석 시 한글+영문 OCR을 실행합니다.</div></div>
+<div class="full" style="display:flex;gap:8px"><button type="button" id="analyze">이미지 사전분석</button><button type="submit">분석 결과로 등록</button></div>
 </div></form></div>
-<div class="c"><h3>이미지 사전분석</h3><div id="analysis" class="muted">이미지를 선택한 뒤 분석하세요.</div><div id="previews" class="preview"></div></div>
+<div class="c"><h3>이미지 사전분석</h3><div id="analysis" class="muted">아직 분석하지 않았습니다.</div><div id="previews" class="preview"></div></div>
 <div class="c"><h3>등록목록</h3><div id="state"></div><div id="list"></div></div>
-<div class="c"><h3>최근 LIVE TRACE</h3><button type="button" onclick="loadTraces()">최근 50건</button><div id="traces" class="profile">TRACE 대기</div></div>
-</div><script>
+<div class="c"><h3>최근 LIVE TRACE</h3><button onclick="loadTraces()">최근 50건</button><div id="traces" class="profile">TRACE 대기</div></div>
+</div>
+<div id="modal" class="modal"><div class="modalbox"><div style="display:flex;justify-content:space-between"><h3 id="modalTitle">분석보기</h3><button class="ghost" onclick="closeModal()">닫기</button></div><div id="modalImage" class="preview"></div><div id="modalBody"></div></div></div>
+<script>
 const $=id=>document.getElementById(id),esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 $('admin').value=sessionStorage.getItem('luper_admin')||'';$('saveKey').onclick=()=>{sessionStorage.setItem('luper_admin',$('admin').value);refresh()};const ah=()=>({'X-Admin-Key':$('admin').value});
 function file64(f){return new Promise((ok,no)=>{if(!f)return ok(null);let r=new FileReader();r.onload=()=>ok(r.result);r.onerror=no;r.readAsDataURL(f)})}
-async function payload(){return{registration_name:$('regname').value.trim(),display_name:$('display').value.trim(),url:$('url').value.trim(),reference_image_base64:await file64($('fullImg').files[0])}}
-$('analyze').onclick=async()=>{const b=await payload();const r=await fetch('/api/analyze_registration',{method:'POST',headers:{'Content-Type':'application/json','X-Admin-Key':$('admin').value},body:JSON.stringify(b)});const x=await r.json();if(!r.ok)return alert(JSON.stringify(x));$('analysis').innerHTML=`힌트: ${esc((x.summary.hint_tokens||[]).join(' / '))}<br>후보어: ${esc((x.summary.recognition_terms||[]).join(' | '))}<br>PRIMARY: ${x.summary.primary_detected?'검출':'없음'} ${esc(JSON.stringify(x.summary.primary_font_top))}<br>SECONDARY: ${x.summary.secondary_detected?'검출':'없음'} ${esc(JSON.stringify(x.summary.secondary_font_top))}<br>색상: ${esc(JSON.stringify(x.summary.full_color))}<br>SIFT: ${x.summary.sift_features}`;$('previews').innerHTML=(x.primary_preview?`<div>PRIMARY<br><img src="${x.primary_preview}"></div>`:'')+(x.secondary_preview?`<div>SECONDARY<br><img src="${x.secondary_preview}"></div>`:'')};
-$('f').onsubmit=async e=>{e.preventDefault();const b=await payload();const r=await fetch('/api/entries',{method:'POST',headers:{'Content-Type':'application/json','X-Admin-Key':$('admin').value},body:JSON.stringify(b)});const x=await r.json();if(!r.ok)return alert(JSON.stringify(x));alert('등록 완료');refresh()};
-async function refresh(){const h=await(await fetch('/health')).json();$('state').textContent=`ONLINE V${h.version} · ${h.entries}개`;const r=await fetch('/api/entries',{headers:ah()});if(!r.ok)return;const a=await r.json();let t='<table><tr><th>등록명</th><th>표시명</th><th>Hint</th><th>Profile</th><th>URL</th></tr>';for(const x of a)t+=`<tr><td>${esc(x.registration_name)}</td><td>${esc(x.display_name)}</td><td>${esc((x.profile_summary?.hint_tokens||[]).join(' / '))}</td><td>${esc(x.profile_summary?.mode||'')} / SIFT ${esc(x.profile_summary?.sift_features||0)}</td><td><a href="${esc(x.url)}" target="_blank">열기</a></td></tr>`;$('list').innerHTML=t+'</table>'}
+let ocrCache={fileKey:'',items:[]},ocrWorker=null;function fileKey(f){return f?`${f.name}:${f.size}:${f.lastModified}`:''}
+async function ensureOcrWorker(){if(ocrWorker)return ocrWorker;$('ocrState').textContent='OCR 엔진 준비 중… 최초 1회 언어데이터 로딩';ocrWorker=await Tesseract.createWorker(['kor','eng'],1,{logger:m=>{if(m.status)$('ocrState').textContent=`OCR ${m.status} ${Math.round((m.progress||0)*100)}%`}});return ocrWorker}
+async function browserOcr(){const f=$('fullImg').files[0];if(!f)return[];const key=fileKey(f);if(ocrCache.fileKey===key&&ocrCache.items.length)return ocrCache.items;const w=await ensureOcrWorker();$('ocrState').textContent='한글+영문 실제 문자를 읽는 중…';const r=await w.recognize(f);const lines=(r.data.lines&&r.data.lines.length?r.data.lines:r.data.words)||[];const items=lines.filter(x=>x.text&&String(x.text).trim().length>1&&x.bbox).map(x=>({text:String(x.text).trim(),confidence:Number(x.confidence||0),bbox:{x0:x.bbox.x0,y0:x.bbox.y0,x1:x.bbox.x1,y1:x.bbox.y1}}));ocrCache={fileKey:key,items};$('ocrState').textContent=`OCR 완료 · ${items.length}개 문자영역`;return items}
+async function payload(){return{registration_name:$('regname').value.trim(),display_name:$('display').value.trim(),url:$('url').value.trim(),reference_image_base64:await file64($('fullImg').files[0]),detected_texts:await browserOcr()}}
+function paletteText(p){return(p?.dominant||[]).map(x=>`${x.family} ${x.percent}%`).join(' / ')}
+function identityHtml(rows){if(!rows?.length)return'<p class="warn">이미지 OCR Identity 없음 · 재등록 권장</p>';return rows.slice(0,20).map(r=>`<div class="identity"><b>${esc(r.text)}</b><span>${esc(r.script)} · ${esc(r.role)}</span><span>x ${r.position.x_pct}% / y ${r.position.y_pct}% / 가로 ${r.position.width_pct}% / 세로 ${r.position.height_pct}%<br>글자형태 ${esc(JSON.stringify(r.font_estimate?.top))}</span><span>${esc(paletteText(r.color))}</span></div>`).join('')}
+$('analyze').onclick=async()=>{if(!$('admin').value)return alert('관리자 키를 저장하세요.');const b=await payload();$('analysis').textContent='Visual Identity 분석 중…';const r=await fetch('/api/analyze_registration',{method:'POST',headers:{'Content-Type':'application/json','X-Admin-Key':$('admin').value},body:JSON.stringify(b)});const x=await r.json();if(!r.ok)return alert(JSON.stringify(x));const sm=x.summary;$('analysis').innerHTML=`<b>등록 힌트</b>: ${esc((sm.hint_tokens||[]).join(' / '))}<br><b>이미지 실제 OCR</b>: ${esc((sm.image_ocr_terms||[]).join(' | '))}<br><b>LIVE 후보어</b>: ${esc((sm.recognition_terms||[]).join(' | '))}<br><b>전체 색상</b>: ${esc(paletteText(sm.full_color))}<br><b>디자인 복잡도</b>: ${esc(sm.design?.visual_complexity_10)}/10 · <b>SIFT</b>: ${sm.sift_features}<br><br><b>TEXT IDENTITY</b>${identityHtml(sm.text_identity)}`;$('previews').innerHTML=(x.primary_preview?`<div>PRIMARY 시각밴드<br><img src="${x.primary_preview}"></div>`:'')+(x.secondary_preview?`<div>SECONDARY 시각밴드<br><img src="${x.secondary_preview}"></div>`:'')};
+$('f').onsubmit=async e=>{e.preventDefault();if(!$('admin').value)return alert('관리자 키를 저장하세요.');const b=await payload();const r=await fetch('/api/entries',{method:'POST',headers:{'Content-Type':'application/json','X-Admin-Key':$('admin').value},body:JSON.stringify(b)});const x=await r.json();if(!r.ok)return alert(JSON.stringify(x));alert('등록 완료');refresh()};
+async function refresh(){const h=await(await fetch('/health')).json();$('state').innerHTML=`<span class="ok">ONLINE</span> V${h.version} · ${h.entries}개`;const r=await fetch('/api/entries',{headers:ah()});if(!r.ok)return;const a=await r.json();let t='<table><tr><th>등록명</th><th>표시명</th><th>이미지 OCR</th><th>색/Visual</th><th>URL</th><th>관리</th></tr>';for(const x of a){const o=x.profile_summary?.image_ocr_terms||[];t+=`<tr><td><b>${esc(x.registration_name)}</b></td><td>${esc(x.display_name)}</td><td>${x.profile_summary?.ocr_ready?esc(o.slice(0,7).join(' / ')):'<span class="warn">OCR 미분석 · 재등록 권장</span>'}</td><td>${esc(paletteText(x.profile_summary?.color))}<br>SIFT ${esc(x.profile_summary?.sift_features||0)}</td><td><a href="${esc(x.url)}" target="_blank">열기</a></td><td><button onclick="showProfile(${x.id})">분석보기</button> <button class="danger" onclick="delx(${x.id})">삭제</button></td></tr>`}$('list').innerHTML=t+'</table>'}
+async function showProfile(id){const r=await fetch('/api/entries/'+id+'/profile',{headers:ah()});if(!r.ok)return alert('분석정보 조회 실패');const x=await r.json(),p=x.profile||{};$('modalTitle').textContent=`${x.registration_name} · 분석정보`;const ir=await fetch('/api/entries/'+id+'/reference-image',{headers:ah()});if(ir.ok){const u=URL.createObjectURL(await ir.blob());$('modalImage').innerHTML=`<div>등록 기준이미지<br><img src="${u}"></div>`}else $('modalImage').innerHTML='';$('modalBody').innerHTML=`<p><b>등록 힌트:</b> ${esc((p.context?.hint_tokens||[]).join(' / '))}</p><p><b>이미지 OCR:</b> ${esc((p.context?.image_ocr_terms||[]).join(' | '))}</p><p><b>전체 후보어:</b> ${esc((p.context?.recognition_terms||[]).join(' | '))}</p><p><b>색상:</b> ${esc(paletteText(p.full_visual?.color))} · <b>디자인:</b> ${esc(p.design?.visual_complexity_10)}/10</p>${identityHtml(p.text_identity||[])}<h4>Raw Identity Profile</h4><div class="profile">${esc(JSON.stringify(p,null,2))}</div>`;$('modal').style.display='block'}
+function closeModal(){$('modal').style.display='none';$('modalImage').innerHTML=''}
+async function delx(id){if(!confirm('이 등록을 삭제할까요?'))return;const r=await fetch('/api/entries/'+id,{method:'DELETE',headers:ah()});if(!r.ok)return alert('삭제 실패');refresh()}
 async function loadTraces(){const r=await fetch('/api/traces?limit=50',{headers:ah()});if(!r.ok)return;$('traces').textContent=(await r.json()).map(x=>`${x.created_at||''} | ${x.session_id} | ${x.event}\n${JSON.stringify(x.payload)}`).join('\n\n')}
-refresh();</script></body></html>"""
-
+$('fullImg').addEventListener('change',()=>{ocrCache={fileKey:'',items:[]};$('ocrState').textContent='새 이미지 선택됨 · 사전분석 시 한글+영문 OCR 실행'});refresh();
+</script></body></html>"""
 
 
 @app.get("/")
@@ -1042,7 +1198,7 @@ def analyze_registration():
     raw=b64_bytes(x.get("reference_image_base64"))
     if not rn or not dn or not raw or decode_gray(raw) is None:
         return jsonify(error="등록명/표시명/기준이미지가 필요합니다."),400
-    p,pr,sr=analyze_registration_image(raw,rn,dn)
+    p,pr,sr=analyze_registration_image(raw,rn,dn,x.get("detected_texts") or [])
     enc=lambda z:("data:image/jpeg;base64,"+base64.b64encode(z).decode("ascii")) if z else None
     return jsonify(ok=True,version=VERSION,summary=registration_analysis_summary(p),primary_preview=enc(pr),secondary_preview=enc(sr))
 
@@ -1054,7 +1210,7 @@ def create_entry():
     raw=b64_bytes(x.get("reference_image_base64"))
     if not rn or not dn or not url or not raw:return jsonify(error="등록명/표시명/URL/기준이미지는 필수입니다."),400
     if decode_gray(raw) is None:return jsonify(error="기준이미지를 읽을 수 없습니다."),400
-    p,pr,sr=analyze_registration_image(raw,rn,dn)
+    p,pr,sr=analyze_registration_image(raw,rn,dn,x.get("detected_texts") or [])
     hints=p.get("context",{}).get("recognition_terms",[])
     item=Link(key_text=rn,registration_name=rn,major_category="",minor_category="",recognition_text=" | ".join(hints),
       display_name=dn,url=url,match_mode="CONTEXT_VISUAL",reference_image=raw,major_reference=pr,minor_reference=sr,
@@ -1076,6 +1232,24 @@ def delete_entry(item_id):
     db.session.commit()
     return jsonify(ok=True)
 
+
+
+@app.get("/api/entries/<int:item_id>/profile")
+def entry_profile(item_id):
+    if not require_admin(): return jsonify(error="unauthorized"),401
+    item=db.session.get(Link,item_id)
+    if not item:return jsonify(error="not found"),404
+    try:p=json.loads(item.identity_profile or "{}")
+    except Exception:p={}
+    f=item.fields()
+    return jsonify(id=item.id,registration_name=f["registration_name"],display_name=f["display_name"],url=item.url,profile=p)
+
+@app.get("/api/entries/<int:item_id>/reference-image")
+def entry_reference_image(item_id):
+    if not require_admin(): return jsonify(error="unauthorized"),401
+    item=db.session.get(Link,item_id)
+    if not item or not item.reference_image:return jsonify(error="not found"),404
+    return Response(item.reference_image,mimetype="image/jpeg")
 
 @app.get("/api/index")
 def registry_index():
@@ -1520,7 +1694,7 @@ def migrate():
         except Exception:
             current = {}
         needs_rebuild = (
-            not current or current.get("profile_version")!="3.0" or
+            not current or current.get("profile_version") not in ("3.0","4.0") or
             not current.get("full_visual", {}).get("sift", {}).get("npz_b64") or
             not current.get("full_visual", {}).get("multiview_sift")
         )
