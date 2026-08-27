@@ -28,7 +28,7 @@ app.config["MAX_CONTENT_LENGTH"] = 15 * 1024 * 1024
 
 db = SQLAlchemy(app)
 ADMIN_KEY = os.getenv("ADMIN_KEY", "change-me")
-VERSION = "0.8.1.1"
+VERSION = "0.8.1.2"
 
 
 class Link(db.Model):
@@ -187,6 +187,134 @@ def normalize_detected_texts(items):
     return out[:80]
 
 
+
+TEXT_LIKENESS_MIN_SCORE=58.0
+
+def _char_quality(text):
+    chars=[c for c in str(text) if not c.isspace()]
+    if not chars:
+        return {"useful_ratio":0.0,"alpha_ratio":0.0,"symbol_ratio":1.0,"repeat_ratio":1.0}
+    useful=sum(1 for c in chars if c.isalnum() or ("가"<=c<="힣"))
+    alpha=sum(1 for c in chars if c.isalpha() or ("가"<=c<="힣"))
+    symbols=len(chars)-useful
+    maxrun=1
+    run=1
+    for i in range(1,len(chars)):
+        if chars[i]==chars[i-1]:
+            run+=1
+            maxrun=max(maxrun,run)
+        else:
+            run=1
+    return {
+        "useful_ratio":useful/max(1,len(chars)),
+        "alpha_ratio":alpha/max(1,len(chars)),
+        "symbol_ratio":symbols/max(1,len(chars)),
+        "repeat_ratio":maxrun/max(1,len(chars)),
+    }
+
+def _crop_text_likeness(raw,bbox):
+    crop=crop_raw_bbox(raw,bbox,2)
+    if not crop:
+        return {"score":0.0}
+    img=decode_gray(crop)
+    if img is None or img.size==0:
+        return {"score":0.0}
+    h,w=img.shape[:2]
+    if h<6 or w<8:
+        return {"score":0.0}
+
+    target_h=80
+    scale=target_h/max(1,h)
+    nw=max(8,int(w*scale))
+    img=cv2.resize(img,(nw,target_h),interpolation=cv2.INTER_AREA if scale<1 else cv2.INTER_CUBIC)
+
+    blur=cv2.GaussianBlur(img,(3,3),0)
+    _,bw1=cv2.threshold(blur,0,255,cv2.THRESH_BINARY_INV+cv2.THRESH_OTSU)
+    _,bw2=cv2.threshold(blur,0,255,cv2.THRESH_BINARY+cv2.THRESH_OTSU)
+
+    def measure(bw):
+        total=bw.size
+        ink=float(np.count_nonzero(bw))/max(1,total)
+        n,labels,stats,_=cv2.connectedComponentsWithStats(bw,8)
+        comps=[]
+        for i in range(1,n):
+            x,y,cw,ch,area=stats[i]
+            if area<6 or ch<4 or cw<2:
+                continue
+            if area>total*0.50:
+                continue
+            comps.append((x,y,cw,ch,area))
+
+        comp_count=len(comps)
+        if comp_count:
+            hs=[c[3] for c in comps]
+            med_h=float(np.median(hs))
+            h_consistency=float(np.mean([1 for hh in hs if 0.45*med_h<=hh<=1.9*med_h]))
+            aspect_ok=float(np.mean([1 for _,_,cw,ch,_ in comps if 0.08<=cw/max(1,ch)<=3.8]))
+        else:
+            h_consistency=0.0
+            aspect_ok=0.0
+
+        edges=cv2.Canny(img,50,130)
+        edge_density=float(np.mean(edges>0))
+        ink_score=max(0.0,1.0-abs(ink-0.24)/0.24)
+        comp_score=min(1.0,comp_count/8.0)
+        edge_score=min(1.0,edge_density/0.18)
+        score=100.0*(0.28*ink_score+0.28*comp_score+0.18*h_consistency+0.14*aspect_ok+0.12*edge_score)
+        return {
+            "score":score,
+            "ink_ratio":ink,
+            "component_count":comp_count,
+            "height_consistency":h_consistency,
+            "aspect_ok":aspect_ok,
+            "edge_density":edge_density,
+        }
+
+    a=measure(bw1)
+    b=measure(bw2)
+    return a if a["score"]>=b["score"] else b
+
+def apply_text_likeness_gate(items,full_raw,registration_name="",display_name=""):
+    rows=normalize_detected_texts(items)
+    out=[]
+    for r in rows:
+        b=r["bbox"]
+        bbox=(b["x0"],b["y0"],b["x1"],b["y1"])
+        charq=_char_quality(r["text"])
+        visual=_crop_text_likeness(full_raw,bbox)
+        hint_score=_hint_similarity_simple(r["text"],registration_name,display_name)
+
+        conf=float(r.get("confidence",0) or 0)
+        useful=charq["useful_ratio"]
+        symbols=charq["symbol_ratio"]
+        repeat=charq["repeat_ratio"]
+        visual_score=float(visual.get("score",0) or 0)
+
+        score=(visual_score*0.48+min(100.0,conf)*0.22+useful*100.0*0.20+min(100.0,hint_score)*0.10)
+        if symbols>0.42: score-=18
+        if repeat>0.34: score-=14
+        if len(norm(r["text"]))<2: score-=25
+
+        passed=score>=TEXT_LIKENESS_MIN_SCORE
+        if conf>=82 and hint_score>=78:
+            passed=True
+
+        reason="TEXT_LIKE" if passed else "NON_TEXT_TEXTURE"
+        if symbols>0.42 and not passed:
+            reason="SYMBOL_HEAVY"
+        elif visual_score<35 and not passed:
+            reason="LOW_TEXT_STRUCTURE"
+
+        x=dict(r)
+        x["text_likeness_score"]=round(max(0.0,min(100.0,score)),1)
+        x["text_likeness_visual"]=round(visual_score,1)
+        x["char_useful_ratio"]=round(useful*100,1)
+        x["text_likeness_passed"]=bool(passed)
+        x["text_likeness_reason"]=reason
+        x["hint_score"]=round(hint_score,1)
+        out.append(x)
+    return out
+
 TEXT_SIZE_GATE_PCT=5.0
 TEXT_SIZE_SOFT_MIN_PCT=3.0
 TEXT_SIZE_SOFT_CONF=75.0
@@ -229,11 +357,9 @@ def apply_text_size_gate(items,image_h,registration_name="",display_name=""):
     return out
 
 def detected_text_terms(items,image_h=None,registration_name="",display_name=""):
-    if image_h is None:
-        rows=normalize_detected_texts(items)
-    else:
-        rows=apply_text_size_gate(items,image_h,registration_name,display_name)
-        rows=[r for r in rows if r.get("size_gate_passed")]
+    rows=normalize_detected_texts(items)
+    if image_h is not None:
+        rows=[r for r in rows if r.get("size_gate_passed",True) and r.get("text_likeness_passed",True)]
 
     def usable(r):
         t=r["text"].strip()
@@ -246,7 +372,6 @@ def detected_text_terms(items,image_h=None,registration_name="",display_name="")
     rows=[r for r in rows if usable(r)]
     terms=[r["text"] for r in rows if r["text"]]
     ordered=sorted(rows,key=lambda r:(r["bbox"]["y0"],r["bbox"]["x0"]))
-
     for a,b in zip(ordered,ordered[1:]):
         ah=max(1,a["bbox"]["y1"]-a["bbox"]["y0"])
         bh=max(1,b["bbox"]["y1"]-b["bbox"]["y0"])
@@ -255,7 +380,6 @@ def detected_text_terms(items,image_h=None,registration_name="",display_name="")
         minw=max(1,min(a["bbox"]["x1"]-a["bbox"]["x0"],b["bbox"]["x1"]-b["bbox"]["x0"]))
         if gap<=max(ah,bh)*1.2 and overlap/minw>=0.25:
             terms.extend([a["text"]+" "+b["text"],a["text"]+b["text"]])
-
     return list(dict.fromkeys(t for t in terms if len(norm(t))>=2))
 
 def script_type(text):
@@ -312,21 +436,33 @@ def region_identity_profiles(full_raw,detected):
     if img is None:return []
     H,W=img.shape[:2]
     out=[]
-    gated=apply_text_size_gate(detected,H,"","")
+    gated=normalize_detected_texts(detected)
+    meta={}
+    for rr in detected or []:
+        try:
+            bb=rr["bbox"]
+            meta[(rr["text"],bb["x0"],bb["y0"],bb["x1"],bb["y1"])]=rr
+        except Exception:
+            pass
     for r in gated:
         b=r["bbox"];box=(b["x0"],b["y0"],b["x1"],b["y1"])
+        key=(r["text"],b["x0"],b["y0"],b["x1"],b["y1"])
+        if key in meta:r.update(meta[key])
         cw=max(1,box[2]-box[0]);ch=max(1,box[3]-box[1])
         wr=cw/max(1,W);hr=ch/max(1,H);area=wr*hr
         crop=crop_raw_bbox(full_raw,box,4)
         typ=typography_features(crop) if crop else {}
         col=palette_profile(crop) if crop else {}
         importance=min(100.0,hr*540+wr*28+area*180+r["confidence"]*0.10)
-        role="PRIMARY" if importance>=55 else ("SECONDARY" if importance>=27 else "DETAIL")
+        valid_text=bool(r.get("text_likeness_passed",True) and r.get("size_gate_passed",True))
+        role=("PRIMARY" if importance>=55 else ("SECONDARY" if importance>=27 else "DETAIL")) if valid_text else "EXCLUDED"
         fam=typ.get("font_family_probabilities",{})
         top_font=max(fam.items(),key=lambda kv:kv[1]) if fam else None
         out.append({
           "text":r["text"],"script":script_type(r["text"]),"confidence":r["confidence"],
           "height_pct":r.get("height_pct"),"size_gate_passed":r.get("size_gate_passed"),"size_gate_reason":r.get("size_gate_reason"),
+          "text_likeness_score":r.get("text_likeness_score"),"text_likeness_visual":r.get("text_likeness_visual"),
+          "text_likeness_passed":r.get("text_likeness_passed"),"text_likeness_reason":r.get("text_likeness_reason"),
           "role":role,"importance":round(importance,1),
           "position":{
             "x_pct":round(box[0]/max(1,W)*100,1),
@@ -360,15 +496,36 @@ def analyze_registration_image(full_raw,registration_name,display_name,detected_
     img0=decode_color(full_raw)
     image_h=img0.shape[0] if img0 is not None else 1
 
-    gated_detected=apply_text_size_gate(
-        detected,image_h,registration_name,display_name
+    likeness_checked=apply_text_likeness_gate(
+        detected,full_raw,registration_name,display_name
     )
-    text_identity=region_identity_profiles(full_raw,gated_detected)
+    likeness_passed=[x for x in likeness_checked if x.get("text_likeness_passed")]
+
+    gated_detected=apply_text_size_gate(
+        likeness_passed,image_h,registration_name,display_name
+    )
+
+    # audit rows: keep excluded non-text OCR visible in registration diagnostics
+    final_map={}
+    for x in likeness_checked:
+        bb=x["bbox"]; key=(x["text"],bb["x0"],bb["y0"],bb["x1"],bb["y1"])
+        final_map[key]=x
+    for x in gated_detected:
+        bb=x["bbox"]; key=(x["text"],bb["x0"],bb["y0"],bb["x1"],bb["y1"])
+        if key in final_map: final_map[key].update(x)
+        else: final_map[key]=x
+    audit_rows=list(final_map.values())
+
+    text_identity=region_identity_profiles(full_raw,audit_rows)
     primary_raw,secondary_raw=detect_text_bands(full_raw)
 
     context_base=context_recognition_terms(registration_name,display_name)
+    final_passed=[
+        x for x in gated_detected
+        if x.get("size_gate_passed") and x.get("text_likeness_passed",True)
+    ]
     image_terms=detected_text_terms(
-        gated_detected,image_h,registration_name,display_name
+        final_passed,image_h,registration_name,display_name
     )
     recognition_terms=list(dict.fromkeys(context_base+image_terms))
 
@@ -411,12 +568,17 @@ def registration_analysis_summary(profile):
       "full_color":profile.get("full_visual",{}).get("color",{}),
       "sift_features":profile.get("full_visual",{}).get("sift",{}).get("count",0),
       "ocr_ready":bool(profile.get("text_identity",[])),
+      "text_likeness_gate":{
+        "min_score":TEXT_LIKENESS_MIN_SCORE,
+        "passed":sum(1 for x in profile.get("text_identity",[]) if x.get("text_likeness_passed")),
+        "excluded":sum(1 for x in profile.get("text_identity",[]) if x.get("text_likeness_passed") is False),
+      },
       "text_size_gate":{
         "hard_pct":TEXT_SIZE_GATE_PCT,
         "soft_min_pct":TEXT_SIZE_SOFT_MIN_PCT,
         "soft_conf":TEXT_SIZE_SOFT_CONF,
         "passed":sum(1 for x in profile.get("text_identity",[]) if x.get("size_gate_passed")),
-        "excluded":sum(1 for x in profile.get("text_identity",[]) if not x.get("size_gate_passed")),
+        "excluded":sum(1 for x in profile.get("text_identity",[]) if x.get("size_gate_passed") is False),
       },
     }
 
@@ -1235,8 +1397,8 @@ async function ensureOcrWorker(){if(ocrWorker)return ocrWorker;$('ocrState').tex
 async function browserOcr(){const f=$('fullImg').files[0];if(!f)return[];const key=fileKey(f);if(ocrCache.fileKey===key&&ocrCache.items.length)return ocrCache.items;const w=await ensureOcrWorker();$('ocrState').textContent='한글+영문 실제 문자를 읽는 중…';const r=await w.recognize(f);const lines=(r.data.lines&&r.data.lines.length?r.data.lines:r.data.words)||[];const items=lines.filter(x=>x.text&&String(x.text).trim().length>1&&x.bbox).map(x=>({text:String(x.text).trim(),confidence:Number(x.confidence||0),bbox:{x0:x.bbox.x0,y0:x.bbox.y0,x1:x.bbox.x1,y1:x.bbox.y1}}));ocrCache={fileKey:key,items};$('ocrState').textContent=`OCR 완료 · ${items.length}개 문자영역`;return items}
 async function payload(){return{registration_name:$('regname').value.trim(),display_name:$('display').value.trim(),url:$('url').value.trim(),reference_image_base64:await file64($('fullImg').files[0]),detected_texts:await browserOcr()}}
 function paletteText(p){return(p?.dominant||[]).map(x=>`${x.family} ${x.percent}%`).join(' / ')}
-function identityHtml(rows){if(!rows?.length)return'<p class="warn">이미지 OCR Identity 없음 · 재등록 권장</p>';return rows.slice(0,20).map(r=>`<div class="identity"><b>${esc(r.text)}</b><span>${esc(r.script)} · ${esc(r.role)}<br>${r.size_gate_passed?'✅ 통과':'❌ 제외'} · 높이 ${esc(r.height_pct)}%<br>${esc(r.size_gate_reason||'')}</span><span>x ${r.position.x_pct}% / y ${r.position.y_pct}% / 가로 ${r.position.width_pct}% / 세로 ${r.position.height_pct}%<br>글자형태 ${esc(JSON.stringify(r.font_estimate?.top))}</span><span>${esc(paletteText(r.color))}</span></div>`).join('')}
-$('analyze').onclick=async()=>{if(!$('admin').value)return alert('관리자 키를 저장하세요.');const b=await payload();$('analysis').textContent='Visual Identity 분석 중…';const r=await fetch('/api/analyze_registration',{method:'POST',headers:{'Content-Type':'application/json','X-Admin-Key':$('admin').value},body:JSON.stringify(b)});const x=await r.json();if(!r.ok)return alert(JSON.stringify(x));const sm=x.summary;$('analysis').innerHTML=`<b>등록 힌트</b>: ${esc((sm.hint_tokens||[]).join(' / '))}<br><b>이미지 실제 OCR</b>: ${esc((sm.image_ocr_terms||[]).join(' | '))}<br><b>LIVE 후보어</b>: ${esc((sm.recognition_terms||[]).join(' | '))}<br><b>전체 색상</b>: ${esc(paletteText(sm.full_color))}<br><b>디자인 복잡도</b>: ${esc(sm.design?.visual_complexity_10)}/10 · <b>SIFT</b>: ${sm.sift_features}<br><b>TEXT SIZE GATE</b>: ${esc(sm.text_size_gate?.hard_pct)}% 이상 기본 통과 / 통과 ${esc(sm.text_size_gate?.passed)} / 제외 ${esc(sm.text_size_gate?.excluded)}<br><br><b>TEXT IDENTITY</b>${identityHtml(sm.text_identity)}`;$('previews').innerHTML=(x.primary_preview?`<div>PRIMARY 시각밴드<br><img src="${x.primary_preview}"></div>`:'')+(x.secondary_preview?`<div>SECONDARY 시각밴드<br><img src="${x.secondary_preview}"></div>`:'')};
+function identityHtml(rows){if(!rows?.length)return'<p class="warn">이미지 OCR Identity 없음 · 재등록 권장</p>';return rows.slice(0,20).map(r=>`<div class="identity"><b>${esc(r.text)}</b><span>${esc(r.script)} · ${esc(r.role)}<br>${r.text_likeness_passed?'✅ 문자성':'❌ 비문자'} ${esc(r.text_likeness_score)}점<br>${esc(r.text_likeness_reason||'')}<br>${r.size_gate_passed?'✅ 크기':'❌ 크기제외'} · 높이 ${esc(r.height_pct)}%<br>${esc(r.size_gate_reason||'')}</span><span>x ${r.position.x_pct}% / y ${r.position.y_pct}% / 가로 ${r.position.width_pct}% / 세로 ${r.position.height_pct}%<br>글자형태 ${esc(JSON.stringify(r.font_estimate?.top))}</span><span>${esc(paletteText(r.color))}</span></div>`).join('')}
+$('analyze').onclick=async()=>{if(!$('admin').value)return alert('관리자 키를 저장하세요.');const b=await payload();$('analysis').textContent='Visual Identity 분석 중…';const r=await fetch('/api/analyze_registration',{method:'POST',headers:{'Content-Type':'application/json','X-Admin-Key':$('admin').value},body:JSON.stringify(b)});const x=await r.json();if(!r.ok)return alert(JSON.stringify(x));const sm=x.summary;$('analysis').innerHTML=`<b>등록 힌트</b>: ${esc((sm.hint_tokens||[]).join(' / '))}<br><b>이미지 실제 OCR</b>: ${esc((sm.image_ocr_terms||[]).join(' | '))}<br><b>LIVE 후보어</b>: ${esc((sm.recognition_terms||[]).join(' | '))}<br><b>전체 색상</b>: ${esc(paletteText(sm.full_color))}<br><b>디자인 복잡도</b>: ${esc(sm.design?.visual_complexity_10)}/10 · <b>SIFT</b>: ${sm.sift_features}<br><b>TEXT LIKENESS</b>: 기준 ${esc(sm.text_likeness_gate?.min_score)}점 / 문자 ${esc(sm.text_likeness_gate?.passed)} / 비문자 제외 ${esc(sm.text_likeness_gate?.excluded)}<br><b>TEXT SIZE GATE</b>: ${esc(sm.text_size_gate?.hard_pct)}% 이상 기본 통과 / 통과 ${esc(sm.text_size_gate?.passed)} / 제외 ${esc(sm.text_size_gate?.excluded)}<br><br><b>TEXT IDENTITY</b>${identityHtml(sm.text_identity)}`;$('previews').innerHTML=(x.primary_preview?`<div>PRIMARY 시각밴드<br><img src="${x.primary_preview}"></div>`:'')+(x.secondary_preview?`<div>SECONDARY 시각밴드<br><img src="${x.secondary_preview}"></div>`:'')};
 $('f').onsubmit=async e=>{e.preventDefault();if(!$('admin').value)return alert('관리자 키를 저장하세요.');const b=await payload();const r=await fetch('/api/entries',{method:'POST',headers:{'Content-Type':'application/json','X-Admin-Key':$('admin').value},body:JSON.stringify(b)});const x=await r.json();if(!r.ok)return alert(JSON.stringify(x));alert('등록 완료');refresh()};
 async function refresh(){const h=await(await fetch('/health')).json();$('state').innerHTML=`<span class="ok">ONLINE</span> V${h.version} · ${h.entries}개`;const r=await fetch('/api/entries',{headers:ah()});if(!r.ok)return;const a=await r.json();let t='<table><tr><th>등록명</th><th>표시명</th><th>이미지 OCR</th><th>색/Visual</th><th>URL</th><th>관리</th></tr>';for(const x of a){const o=x.profile_summary?.image_ocr_terms||[];t+=`<tr><td><b>${esc(x.registration_name)}</b></td><td>${esc(x.display_name)}</td><td>${x.profile_summary?.ocr_ready?esc(o.slice(0,7).join(' / ')):'<span class="warn">OCR 미분석 · 재등록 권장</span>'}</td><td>${esc(paletteText(x.profile_summary?.color))}<br>SIFT ${esc(x.profile_summary?.sift_features||0)}</td><td><a href="${esc(x.url)}" target="_blank">열기</a></td><td><button onclick="showProfile(${x.id})">분석보기</button> <button class="danger" onclick="delx(${x.id})">삭제</button></td></tr>`}$('list').innerHTML=t+'</table>'}
 async function showProfile(id){const r=await fetch('/api/entries/'+id+'/profile',{headers:ah()});if(!r.ok)return alert('분석정보 조회 실패');const x=await r.json(),p=x.profile||{};$('modalTitle').textContent=`${x.registration_name} · 분석정보`;const ir=await fetch('/api/entries/'+id+'/reference-image',{headers:ah()});if(ir.ok){const u=URL.createObjectURL(await ir.blob());$('modalImage').innerHTML=`<div>등록 기준이미지<br><img src="${u}"></div>`}else $('modalImage').innerHTML='';$('modalBody').innerHTML=`<p><b>등록 힌트:</b> ${esc((p.context?.hint_tokens||[]).join(' / '))}</p><p><b>이미지 OCR:</b> ${esc((p.context?.image_ocr_terms||[]).join(' | '))}</p><p><b>전체 후보어:</b> ${esc((p.context?.recognition_terms||[]).join(' | '))}</p><p><b>색상:</b> ${esc(paletteText(p.full_visual?.color))} · <b>디자인:</b> ${esc(p.design?.visual_complexity_10)}/10</p>${identityHtml(p.text_identity||[])}<h4>Raw Identity Profile</h4><div class="profile">${esc(JSON.stringify(p,null,2))}</div>`;$('modal').style.display='block'}
