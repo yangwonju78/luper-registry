@@ -28,7 +28,7 @@ app.config["MAX_CONTENT_LENGTH"] = 15 * 1024 * 1024
 
 db = SQLAlchemy(app)
 ADMIN_KEY = os.getenv("ADMIN_KEY", "change-me")
-VERSION = "0.8.1.3"
+VERSION = "0.8.1.4"
 
 
 class Link(db.Model):
@@ -43,6 +43,13 @@ class Link(db.Model):
     display_name = db.Column(db.String(300), nullable=False)
     group_name = db.Column(db.String(300), nullable=False, default="")
     action_name = db.Column(db.String(300), nullable=False, default="")
+    hint_text = db.Column(db.Text, nullable=False, default="")
+    link_title_1 = db.Column(db.String(200), nullable=False, default="")
+    link_url_1 = db.Column(db.Text, nullable=False, default="")
+    link_title_2 = db.Column(db.String(200), nullable=False, default="")
+    link_url_2 = db.Column(db.Text, nullable=False, default="")
+    link_title_3 = db.Column(db.String(200), nullable=False, default="")
+    link_url_3 = db.Column(db.Text, nullable=False, default="")
     url = db.Column(db.Text, nullable=False)
 
     match_mode = db.Column(db.String(30), nullable=False, default="auto")
@@ -88,9 +95,13 @@ class Link(db.Model):
         return {
             "id": self.id,
             **f,
-            "group_name": (self.group_name or f["registration_name"]).strip(),
-            "action_name": (self.action_name or "").strip(),
-            "url": self.url,
+            "hint_text": (self.hint_text or "").strip(),
+            "links": [
+                {"title": (self.link_title_1 or "열기").strip(), "url": (self.link_url_1 or self.url or "").strip()},
+                *([{"title": (self.link_title_2 or "").strip(), "url": (self.link_url_2 or "").strip()}] if (self.link_url_2 or "").strip() else []),
+                *([{"title": (self.link_title_3 or "").strip(), "url": (self.link_url_3 or "").strip()}] if (self.link_url_3 or "").strip() else []),
+            ],
+            "url": (self.link_url_1 or self.url or "").strip(),
             "match_mode": self.match_mode or "auto",
             "use_location": bool(self.use_location),
             "latitude": self.latitude,
@@ -495,7 +506,7 @@ def image_design_profile(raw,regions):
       "text_region_count":len(regions),
     }
 
-def analyze_registration_image(full_raw,registration_name,display_name,detected_texts=None):
+def analyze_registration_image(full_raw,registration_name,display_name,detected_texts=None,hint_text=""):
     detected=normalize_detected_texts(detected_texts or [])
     img0=decode_color(full_raw)
     image_h=img0.shape[0] if img0 is not None else 1
@@ -523,7 +534,7 @@ def analyze_registration_image(full_raw,registration_name,display_name,detected_
     text_identity=region_identity_profiles(full_raw,audit_rows)
     primary_raw,secondary_raw=detect_text_bands(full_raw)
 
-    context_base=context_recognition_terms(registration_name,display_name)
+    context_base=context_recognition_terms(registration_name,display_name) + [x.strip() for x in re.split(r"[/,|\n]+", hint_text or "") if x.strip()]
     final_passed=[
         x for x in gated_detected
         if x.get("size_gate_passed") and x.get("text_likeness_passed",True)
@@ -539,7 +550,8 @@ def analyze_registration_image(full_raw,registration_name,display_name,detected_
       "context":{
         "registration_name":registration_name,
         "display_name":display_name,
-        "hint_tokens":context_tokens(registration_name,display_name),
+        "hint_text":hint_text,
+        "hint_tokens":context_tokens(registration_name,display_name) + [x.strip() for x in re.split(r"[/,|\n]+", hint_text or "") if x.strip()],
         "image_ocr_terms":image_terms,
         "recognition_terms":recognition_terms,
         "note":"등록명/표시명은 힌트, image_ocr_terms는 등록 이미지에서 실제 검출한 문자."
@@ -1479,9 +1491,13 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#f5f6f8;margin:0;
 <div class="c"><form id="f"><div class="g">
 <div><label>등록명 · 분석 힌트</label><input id="regname" required placeholder="이기는 습관 샘앤파커스"></div>
 <div><label>표시명 · 링크카드 표시</label><input id="display" required placeholder="이기는 습관"></div>
-<div><label>그룹명 · 결과 묶음용</label><input id="groupname" placeholder="예: 살만온족발 / Galaxy / 이기는 습관"></div>
-<div><label>액션명 · 카드 기능</label><input id="actionname" placeholder="예: 브랜드 / 메뉴 / 배달주문 / 설명서"></div>
-<div class="full"><label>URL</label><input id="url" required placeholder="https://..."></div>
+<div class="full"><label>힌트 · 후보 검색 보조</label><input id="hint" placeholder="예: 이기는 습관 / Winning Habit / 샘앤파커스"></div>
+<div><label>링크 1 타이틀</label><input id="linktitle1" required placeholder="예: 책 소개"></div>
+<div><label>링크 1 URL</label><input id="linkurl1" required placeholder="https://..."></div>
+<div><label>링크 2 타이틀</label><input id="linktitle2" placeholder="예: 구매하기"></div>
+<div><label>링크 2 URL</label><input id="linkurl2" placeholder="https://..."></div>
+<div><label>링크 3 타이틀</label><input id="linktitle3" placeholder="예: 출판사"></div>
+<div><label>링크 3 URL</label><input id="linkurl3" placeholder="https://..."></div>
 <div class="full"><label>기준 이미지</label><input id="fullImg" type="file" accept="image/*" required></div>
 <div class="full"><div id="ocrState" class="muted">사전분석 시 한글+영문 OCR을 실행합니다.</div></div>
 <div class="full" style="display:flex;gap:8px"><button type="button" id="analyze">이미지 사전분석</button><button type="submit">분석 결과로 등록</button></div>
@@ -1498,13 +1514,28 @@ function file64(f){return new Promise((ok,no)=>{if(!f)return ok(null);let r=new 
 let ocrCache={fileKey:'',items:[]},ocrWorker=null;function fileKey(f){return f?`${f.name}:${f.size}:${f.lastModified}`:''}
 async function ensureOcrWorker(){if(ocrWorker)return ocrWorker;$('ocrState').textContent='OCR 엔진 준비 중… 최초 1회 언어데이터 로딩';ocrWorker=await Tesseract.createWorker(['kor','eng'],1,{logger:m=>{if(m.status)$('ocrState').textContent=`OCR ${m.status} ${Math.round((m.progress||0)*100)}%`}});return ocrWorker}
 async function browserOcr(){const f=$('fullImg').files[0];if(!f)return[];const key=fileKey(f);if(ocrCache.fileKey===key&&ocrCache.items.length)return ocrCache.items;const w=await ensureOcrWorker();$('ocrState').textContent='한글+영문 실제 문자를 읽는 중…';const r=await w.recognize(f);const lines=(r.data.lines&&r.data.lines.length?r.data.lines:r.data.words)||[];const items=lines.filter(x=>x.text&&String(x.text).trim().length>1&&x.bbox).map(x=>({text:String(x.text).trim(),confidence:Number(x.confidence||0),bbox:{x0:x.bbox.x0,y0:x.bbox.y0,x1:x.bbox.x1,y1:x.bbox.y1}}));ocrCache={fileKey:key,items};$('ocrState').textContent=`OCR 완료 · ${items.length}개 문자영역`;return items}
-async function payload(){return{registration_name:$('regname').value.trim(),display_name:$('display').value.trim(),group_name:$('groupname').value.trim(),action_name:$('actionname').value.trim(),url:$('url').value.trim(),reference_image_base64:await file64($('fullImg').files[0]),detected_texts:await browserOcr()}}
+async function payload(){
+ const links=[
+   {title:$('linktitle1').value.trim(),url:$('linkurl1').value.trim()},
+   {title:$('linktitle2').value.trim(),url:$('linkurl2').value.trim()},
+   {title:$('linktitle3').value.trim(),url:$('linkurl3').value.trim()}
+ ].filter(x=>x.url);
+ return{
+   registration_name:$('regname').value.trim(),
+   display_name:$('display').value.trim(),
+   hint_text:$('hint').value.trim(),
+   url:links.length?links[0].url:'',
+   links,
+   reference_image_base64:await file64($('fullImg').files[0]),
+   detected_texts:await browserOcr()
+ };
+}
 function paletteText(p){return(p?.dominant||[]).map(x=>`${x.family} ${x.percent}%`).join(' / ')}
 function identityHtml(rows){if(!rows?.length)return'<p class="warn">이미지 OCR Identity 없음 · 재등록 권장</p>';return rows.slice(0,20).map(r=>`<div class="identity"><b>${esc(r.text)}</b><span>${esc(r.script)} · ${esc(r.role)}<br>${r.text_likeness_passed?'✅ 문자성':'❌ 비문자'} ${esc(r.text_likeness_score)}점<br>${esc(r.text_likeness_reason||'')}<br>${r.size_gate_passed?'✅ 크기':'❌ 크기제외'} · 높이 ${esc(r.height_pct)}%<br>${esc(r.size_gate_reason||'')}</span><span>x ${r.position.x_pct}% / y ${r.position.y_pct}% / 가로 ${r.position.width_pct}% / 세로 ${r.position.height_pct}%<br>글자형태 ${esc(JSON.stringify(r.font_estimate?.top))}</span><span>${esc(paletteText(r.color))}</span></div>`).join('')}
 $('analyze').onclick=async()=>{if(!$('admin').value)return alert('관리자 키를 저장하세요.');const b=await payload();$('analysis').textContent='Visual Identity 분석 중…';const r=await fetch('/api/analyze_registration',{method:'POST',headers:{'Content-Type':'application/json','X-Admin-Key':$('admin').value},body:JSON.stringify(b)});const x=await r.json();if(!r.ok)return alert(JSON.stringify(x));const sm=x.summary;$('analysis').innerHTML=`<b>등록 힌트</b>: ${esc((sm.hint_tokens||[]).join(' / '))}<br><b>이미지 실제 OCR</b>: ${esc((sm.image_ocr_terms||[]).join(' | '))}<br><b>LIVE 후보어</b>: ${esc((sm.recognition_terms||[]).join(' | '))}<br><b>전체 색상</b>: ${esc(paletteText(sm.full_color))}<br><b>디자인 복잡도</b>: ${esc(sm.design?.visual_complexity_10)}/10 · <b>SIFT</b>: ${sm.sift_features}<br><b>TEXT LIKENESS</b>: 기준 ${esc(sm.text_likeness_gate?.min_score)}점 / 문자 ${esc(sm.text_likeness_gate?.passed)} / 비문자 제외 ${esc(sm.text_likeness_gate?.excluded)}<br><b>TEXT SIZE GATE</b>: ${esc(sm.text_size_gate?.hard_pct)}% 이상 기본 통과 / 통과 ${esc(sm.text_size_gate?.passed)} / 제외 ${esc(sm.text_size_gate?.excluded)}<br><br><b>TEXT IDENTITY</b>${identityHtml(sm.text_identity)}`;$('previews').innerHTML=(x.primary_preview?`<div>PRIMARY 시각밴드<br><img src="${x.primary_preview}"></div>`:'')+(x.secondary_preview?`<div>SECONDARY 시각밴드<br><img src="${x.secondary_preview}"></div>`:'')};
 $('f').onsubmit=async e=>{e.preventDefault();if(!$('admin').value)return alert('관리자 키를 저장하세요.');const b=await payload();const r=await fetch('/api/entries',{method:'POST',headers:{'Content-Type':'application/json','X-Admin-Key':$('admin').value},body:JSON.stringify(b)});const x=await r.json();if(!r.ok)return alert(JSON.stringify(x));alert('등록 완료');refresh()};
-async function refresh(){const h=await(await fetch('/health')).json();$('state').innerHTML=`<span class="ok">ONLINE</span> V${h.version} · ${h.entries}개`;const r=await fetch('/api/entries',{headers:ah()});if(!r.ok)return;const a=await r.json();let t='<table><tr><th>등록명</th><th>표시명</th><th>그룹/액션</th><th>이미지 OCR</th><th>색/Visual</th><th>URL</th><th>관리</th></tr>';for(const x of a){const o=x.profile_summary?.image_ocr_terms||[];t+=`<tr><td><b>${esc(x.registration_name)}</b></td><td>${esc(x.display_name)}</td><td>${esc(x.group_name||'')} / ${esc(x.action_name||'')}</td><td>${x.profile_summary?.ocr_ready?esc(o.slice(0,7).join(' / ')):'<span class="warn">OCR 미분석 · 재등록 권장</span>'}</td><td>${esc(paletteText(x.profile_summary?.color))}<br>SIFT ${esc(x.profile_summary?.sift_features||0)}</td><td><a href="${esc(x.url)}" target="_blank">열기</a></td><td><button onclick="showProfile(${x.id})">분석보기</button> <button class="danger" onclick="delx(${x.id})">삭제</button></td></tr>`}$('list').innerHTML=t+'</table>'}
-async function showProfile(id){const r=await fetch('/api/entries/'+id+'/profile',{headers:ah()});if(!r.ok)return alert('분석정보 조회 실패');const x=await r.json(),p=x.profile||{};$('modalTitle').textContent=`${x.registration_name} · 분석정보`;const ir=await fetch('/api/entries/'+id+'/reference-image',{headers:ah()});if(ir.ok){const u=URL.createObjectURL(await ir.blob());$('modalImage').innerHTML=`<div>등록 기준이미지<br><img src="${u}"></div>`}else $('modalImage').innerHTML='';$('modalBody').innerHTML=`<p><b>그룹/액션:</b> ${esc(x.group_name||'')} / ${esc(x.action_name||'')}</p><p><b>등록 힌트:</b> ${esc((p.context?.hint_tokens||[]).join(' / '))}</p><p><b>이미지 OCR:</b> ${esc((p.context?.image_ocr_terms||[]).join(' | '))}</p><p><b>전체 후보어:</b> ${esc((p.context?.recognition_terms||[]).join(' | '))}</p><p><b>색상:</b> ${esc(paletteText(p.full_visual?.color))} · <b>디자인:</b> ${esc(p.design?.visual_complexity_10)}/10</p>${identityHtml(p.text_identity||[])}<h4>Raw Identity Profile</h4><div class="profile">${esc(JSON.stringify(p,null,2))}</div>`;$('modal').style.display='block'}
+async function refresh(){const h=await(await fetch('/health')).json();$('state').innerHTML=`<span class="ok">ONLINE</span> V${h.version} · ${h.entries}개`;const r=await fetch('/api/entries',{headers:ah()});if(!r.ok)return;const a=await r.json();let t='<table><tr><th>등록명</th><th>표시명</th><th>힌트</th><th>링크</th><th>이미지 OCR</th><th>색/Visual</th><th>URL</th><th>관리</th></tr>';for(const x of a){const o=x.profile_summary?.image_ocr_terms||[];t+=`<tr><td><b>${esc(x.registration_name)}</b></td><td>${esc(x.display_name)}</td><td>${esc(x.hint_text||'')}</td><td>${(x.links||[]).map(v=>esc(v.title)).join(' / ')}</td><td>${x.profile_summary?.ocr_ready?esc(o.slice(0,7).join(' / ')):'<span class="warn">OCR 미분석 · 재등록 권장</span>'}</td><td>${esc(paletteText(x.profile_summary?.color))}<br>SIFT ${esc(x.profile_summary?.sift_features||0)}</td><td><a href="${esc(x.url)}" target="_blank">열기</a></td><td><button onclick="showProfile(${x.id})">분석보기</button> <button class="danger" onclick="delx(${x.id})">삭제</button></td></tr>`}$('list').innerHTML=t+'</table>'}
+async function showProfile(id){const r=await fetch('/api/entries/'+id+'/profile',{headers:ah()});if(!r.ok)return alert('분석정보 조회 실패');const x=await r.json(),p=x.profile||{};$('modalTitle').textContent=`${x.registration_name} · 분석정보`;const ir=await fetch('/api/entries/'+id+'/reference-image',{headers:ah()});if(ir.ok){const u=URL.createObjectURL(await ir.blob());$('modalImage').innerHTML=`<div>등록 기준이미지<br><img src="${u}"></div>`}else $('modalImage').innerHTML='';$('modalBody').innerHTML=`<p><b>힌트:</b> ${esc(x.hint_text||'')}</p><p><b>링크:</b> ${(x.links||[]).map(v=>esc(v.title)+' → '+esc(v.url)).join('<br>')}</p><p><b>등록 힌트:</b> ${esc((p.context?.hint_tokens||[]).join(' / '))}</p><p><b>이미지 OCR:</b> ${esc((p.context?.image_ocr_terms||[]).join(' | '))}</p><p><b>전체 후보어:</b> ${esc((p.context?.recognition_terms||[]).join(' | '))}</p><p><b>색상:</b> ${esc(paletteText(p.full_visual?.color))} · <b>디자인:</b> ${esc(p.design?.visual_complexity_10)}/10</p>${identityHtml(p.text_identity||[])}<h4>Raw Identity Profile</h4><div class="profile">${esc(JSON.stringify(p,null,2))}</div>`;$('modal').style.display='block'}
 function closeModal(){$('modal').style.display='none';$('modalImage').innerHTML=''}
 async function delx(id){if(!confirm('이 등록을 삭제할까요?'))return;const r=await fetch('/api/entries/'+id,{method:'DELETE',headers:ah()});if(!r.ok)return alert('삭제 실패');refresh()}
 async function loadTraces(){const r=await fetch('/api/traces?limit=50',{headers:ah()});if(!r.ok)return;$('traces').textContent=(await r.json()).map(x=>`${x.created_at||''} | ${x.session_id} | ${x.event}\n${JSON.stringify(x.payload)}`).join('\n\n')}
@@ -1538,7 +1569,7 @@ def analyze_registration():
     raw=b64_bytes(x.get("reference_image_base64"))
     if not rn or not dn or not raw or decode_gray(raw) is None:
         return jsonify(error="등록명/표시명/기준이미지가 필요합니다."),400
-    p,pr,sr=analyze_registration_image(raw,rn,dn,x.get("detected_texts") or [])
+    p,pr,sr=analyze_registration_image(raw,rn,dn,x.get("detected_texts") or [],x.get("hint_text",""))
     enc=lambda z:("data:image/jpeg;base64,"+base64.b64encode(z).decode("ascii")) if z else None
     return jsonify(ok=True,version=VERSION,summary=registration_analysis_summary(p),primary_preview=enc(pr),secondary_preview=enc(sr))
 
@@ -1547,15 +1578,34 @@ def create_entry():
     if not require_admin():return jsonify(error="unauthorized"),401
     x=request.get_json(silent=True) or {}
     rn=str(x.get("registration_name","")).strip();dn=str(x.get("display_name","")).strip();url=str(x.get("url","")).strip()
-    group_name=str(x.get("group_name","")).strip()
-    action_name=str(x.get("action_name","")).strip()
+    hint_text=str(x.get("hint_text","")).strip()
+    links=x.get("links") or []
+    clean_links=[]
+    for it in links[:3]:
+        if not isinstance(it,dict):
+            continue
+        ttl=str(it.get("title","")).strip()
+        u=str(it.get("url","")).strip()
+        if u:
+            clean_links.append({"title":ttl or "열기","url":u})
+    if not clean_links and url:
+        clean_links=[{"title":"열기","url":url}]
     raw=b64_bytes(x.get("reference_image_base64"))
     if not rn or not dn or not url or not raw:return jsonify(error="등록명/표시명/URL/기준이미지는 필수입니다."),400
     if decode_gray(raw) is None:return jsonify(error="기준이미지를 읽을 수 없습니다."),400
-    p,pr,sr=analyze_registration_image(raw,rn,dn,x.get("detected_texts") or [])
+    p,pr,sr=analyze_registration_image(raw,rn,dn,x.get("detected_texts") or [],x.get("hint_text",""))
     hints=p.get("context",{}).get("recognition_terms",[])
     item=Link(key_text=rn,registration_name=rn,major_category="",minor_category="",recognition_text=" | ".join(hints),
-      display_name=dn,group_name=(group_name or rn),action_name=action_name,url=url,match_mode="CONTEXT_VISUAL",reference_image=raw,major_reference=pr,minor_reference=sr,
+      display_name=dn,
+        group_name="",action_name="",
+        hint_text=hint_text,
+        link_title_1=clean_links[0]["title"] if len(clean_links)>0 else "열기",
+        link_url_1=clean_links[0]["url"] if len(clean_links)>0 else url,
+        link_title_2=clean_links[1]["title"] if len(clean_links)>1 else "",
+        link_url_2=clean_links[1]["url"] if len(clean_links)>1 else "",
+        link_title_3=clean_links[2]["title"] if len(clean_links)>2 else "",
+        link_url_3=clean_links[2]["url"] if len(clean_links)>2 else "",
+        url=(clean_links[0]["url"] if clean_links else url),match_mode="CONTEXT_VISUAL",reference_image=raw,major_reference=pr,minor_reference=sr,
       visual_threshold=48.0,priority=int(x.get("priority") or 0),use_location=bool(x.get("use_location")),
       latitude=float(x["latitude"]) if x.get("latitude") is not None else None,
       longitude=float(x["longitude"]) if x.get("longitude") is not None else None,
@@ -1584,7 +1634,18 @@ def entry_profile(item_id):
     try:p=json.loads(item.identity_profile or "{}")
     except Exception:p={}
     f=item.fields()
-    return jsonify(id=item.id,registration_name=f["registration_name"],display_name=f["display_name"],group_name=(item.group_name or f["registration_name"]),action_name=(item.action_name or ""),url=item.url,profile=p)
+    return jsonify(
+        id=item.id,
+        registration_name=f["registration_name"],
+        display_name=f["display_name"],
+        hint_text=(item.hint_text or ""),
+        links=[
+            {"title":item.link_title_1 or "열기","url":item.link_url_1 or item.url},
+            *([{"title":item.link_title_2,"url":item.link_url_2}] if item.link_url_2 else []),
+            *([{"title":item.link_title_3,"url":item.link_url_3}] if item.link_url_3 else []),
+        ],
+        profile=p
+    )
 
 @app.get("/api/entries/<int:item_id>/reference-image")
 def entry_reference_image(item_id):
@@ -1602,7 +1663,9 @@ def registry_index():
         try:p=json.loads(r.identity_profile or "{}")
         except Exception:p={}
         terms=p.get("context",{}).get("recognition_terms") or context_recognition_terms(f["registration_name"],f["display_name"])
-        data.append({"id":r.id,"registration_name":f["registration_name"],"display_name":f["display_name"],"group_name":(r.group_name or f["registration_name"]),"action_name":(r.action_name or ""),"recognition_terms":terms,"priority":r.priority,"match_mode":r.match_mode or "CONTEXT_VISUAL"})
+        hint_terms=[x.strip() for x in re.split(r"[/,|\n]+", r.hint_text or "") if x.strip()]
+        terms=list(dict.fromkeys(terms+hint_terms))
+        data.append({"id":r.id,"registration_name":f["registration_name"],"display_name":f["display_name"],"recognition_terms":terms,"priority":r.priority,"match_mode":r.match_mode or "CONTEXT_VISUAL"})
     return jsonify(entries=data,version=VERSION)
 
 
@@ -1696,9 +1759,12 @@ def qr_fast_verify():
             "id":row.id,
             "registration_name":f["registration_name"],
             "display_name":f["display_name"],
-            "group_name":(row.group_name or f["registration_name"]),
-            "action_name":(row.action_name or ""),
-            "url":row.url,
+            "links":[
+                {"title":row.link_title_1 or "열기","url":row.link_url_1 or row.url},
+                *([{"title":row.link_title_2,"url":row.link_url_2}] if row.link_url_2 else []),
+                *([{"title":row.link_title_3,"url":row.link_url_3}] if row.link_url_3 else []),
+            ],
+            "url":row.link_url_1 or row.url,
             "visual_method":"FRONT_SIFT_QR_FAST",
             "matched_view":"front",
             "tested_views":1,
@@ -2042,6 +2108,13 @@ def migrate():
         ("identity_profile", "TEXT"),
         ("group_name", "VARCHAR(300)"),
         ("action_name", "VARCHAR(300)"),
+        ("hint_text", "TEXT"),
+        ("link_title_1", "VARCHAR(200)"),
+        ("link_url_1", "TEXT"),
+        ("link_title_2", "VARCHAR(200)"),
+        ("link_url_2", "TEXT"),
+        ("link_title_3", "VARCHAR(200)"),
+        ("link_url_3", "TEXT"),
     ]
     with db.engine.begin() as conn:
         for name, typ in additions:
