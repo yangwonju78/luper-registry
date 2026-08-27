@@ -28,7 +28,7 @@ app.config["MAX_CONTENT_LENGTH"] = 15 * 1024 * 1024
 
 db = SQLAlchemy(app)
 ADMIN_KEY = os.getenv("ADMIN_KEY", "change-me")
-VERSION = "0.8.1.4"
+VERSION = "0.8.1.5"
 
 
 class Link(db.Model):
@@ -562,6 +562,7 @@ def analyze_registration_image(full_raw,registration_name,display_name,detected_
         "secondary":region_profile(secondary_raw) if secondary_raw else {}
       },
       "design":image_design_profile(full_raw,text_identity),
+      "visual_embedding":visual_embedding(full_raw),
       "full_visual":{
         "color":palette_profile(full_raw),
         "typography":typography_features(full_raw),
@@ -597,6 +598,102 @@ def registration_analysis_summary(profile):
         "excluded":sum(1 for x in profile.get("text_identity",[]) if x.get("size_gate_passed") is False),
       },
     }
+
+
+# -------------------------- lightweight visual embedding --------------------------
+# Purpose:
+# - fast database candidate retrieval before OCR/SIFT verification
+# - no external ML runtime/model download required
+# - combines coarse HSV spatial histograms + grayscale gradient layout
+# This is an embedding/search stage, not the final verifier.
+
+VISUAL_EMBED_VERSION="LVE1"
+
+def visual_embedding(raw):
+    img=decode_color(raw)
+    if img is None:
+        return {"version":VISUAL_EMBED_VERSION,"vec":[]}
+
+    img=cv2.resize(img,(96,96),interpolation=cv2.INTER_AREA)
+    hsv=cv2.cvtColor(img,cv2.COLOR_BGR2HSV)
+    gray=cv2.cvtColor(img,cv2.COLOR_BGR2GRAY)
+
+    feats=[]
+
+    # 3x3 spatial HSV histogram: preserves rough object/layout identity.
+    for gy in range(3):
+        for gx in range(3):
+            y0=gy*32; y1=(gy+1)*32
+            x0=gx*32; x1=(gx+1)*32
+            cell=hsv[y0:y1,x0:x1]
+
+            hh=cv2.calcHist([cell],[0],None,[8],[0,180]).reshape(-1)
+            ss=cv2.calcHist([cell],[1],None,[4],[0,256]).reshape(-1)
+            vv=cv2.calcHist([cell],[2],None,[4],[0,256]).reshape(-1)
+            for arr in (hh,ss,vv):
+                sm=float(arr.sum())
+                if sm>0: arr=arr/sm
+                feats.extend(arr.astype(np.float32).tolist())
+
+    # Gradient orientation layout (4x4 cells × 4 bins)
+    gx=cv2.Sobel(gray,cv2.CV_32F,1,0,ksize=3)
+    gy=cv2.Sobel(gray,cv2.CV_32F,0,1,ksize=3)
+    mag,ang=cv2.cartToPolar(gx,gy,angleInDegrees=True)
+    for cy in range(4):
+        for cx in range(4):
+            y0=cy*24; y1=(cy+1)*24
+            x0=cx*24; x1=(cx+1)*24
+            m=mag[y0:y1,x0:x1].reshape(-1)
+            a=ang[y0:y1,x0:x1].reshape(-1)%180.0
+            hist=np.zeros(4,dtype=np.float32)
+            bins=np.minimum(3,(a/45.0).astype(np.int32))
+            for bi,ww in zip(bins,m):
+                hist[bi]+=float(ww)
+            sm=float(hist.sum())
+            if sm>0: hist/=sm
+            feats.extend(hist.tolist())
+
+    # Low-frequency grayscale layout, 12x12.
+    tiny=cv2.resize(gray,(12,12),interpolation=cv2.INTER_AREA).astype(np.float32)/255.0
+    tiny=(tiny-float(tiny.mean()))/(float(tiny.std())+1e-4)
+    feats.extend(np.clip(tiny.reshape(-1),-3,3).tolist())
+
+    v=np.asarray(feats,dtype=np.float32)
+    n=float(np.linalg.norm(v))
+    if n>0:v/=n
+    return {"version":VISUAL_EMBED_VERSION,"vec":[round(float(x),6) for x in v]}
+
+def visual_embedding_similarity(a,b):
+    try:
+        va=np.asarray((a or {}).get("vec",[]),dtype=np.float32)
+        vb=np.asarray((b or {}).get("vec",[]),dtype=np.float32)
+        if len(va)==0 or len(va)!=len(vb): return 0.0
+        na=float(np.linalg.norm(va)); nb=float(np.linalg.norm(vb))
+        if na<=0 or nb<=0:return 0.0
+        cos=float(np.dot(va,vb)/(na*nb))
+        # map practical cosine range to 0..100 candidate score
+        return round(max(0.0,min(100.0,(cos-0.15)/0.85*100.0)),1)
+    except Exception:
+        return 0.0
+
+def _profile_visual_embedding(row):
+    try:
+        p=json.loads(row.identity_profile or "{}")
+    except Exception:
+        p={}
+    emb=p.get("visual_embedding")
+    if emb and emb.get("version")==VISUAL_EMBED_VERSION and emb.get("vec"):
+        return emb
+    # Lazy fallback for old registrations.
+    emb=visual_embedding(row.reference_image)
+    try:
+        p["visual_embedding"]=emb
+        row.identity_profile=json.dumps(p,ensure_ascii=False)
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+    return emb
+
 
 # -------------------------- text / hangul --------------------------
 
@@ -1687,6 +1784,147 @@ def candidates():
     return jsonify(candidates=out[:8], version=VERSION)
 
 
+
+
+
+@app.post("/api/visual_candidates")
+def visual_candidates():
+    """
+    Fast first-stage visual retrieval.
+    One LIVE frame embedding is compared with precomputed registration embeddings.
+    No SIFT / homography here.
+    """
+    started=time.perf_counter()
+    x=request.get_json(silent=True) or {}
+    raw=b64_bytes(x.get("image_base64"))
+    limit=max(1,min(8,int(x.get("limit",6) or 6)))
+    if not raw:
+        return jsonify(candidates=[],elapsed_ms=0,version=VERSION)
+
+    live=visual_embedding(raw)
+    scored=[]
+    rows=Link.query.filter_by(enabled=True).all()
+    for row in rows:
+        emb=_profile_visual_embedding(row)
+        score=visual_embedding_similarity(emb,live)
+        if score<=0: continue
+        f=row.fields()
+        scored.append({
+            "id":row.id,
+            "registration_name":f["registration_name"],
+            "display_name":f["display_name"],
+            "embedding_score":score,
+        })
+
+    scored.sort(key=lambda q:q["embedding_score"],reverse=True)
+    elapsed=int((time.perf_counter()-started)*1000)
+    return jsonify(candidates=scored[:limit],elapsed_ms=elapsed,version=VERSION)
+
+
+
+@app.post("/api/hybrid_verify")
+def hybrid_verify():
+    """
+    Hybrid decision:
+    - embedding candidates are already ranked
+    - text_support is supplied by the app for each candidate
+    - strong embedding + strong text can pass without SIFT
+    - otherwise run prepared SIFT only for ambiguous candidates
+    """
+    started=time.perf_counter()
+    x=request.get_json(silent=True) or {}
+    raw=b64_bytes(x.get("image_base64"))
+    items=x.get("candidates") or []
+    lat,lon=x.get("lat"),x.get("lon")
+    if not raw or not items:
+        return jsonify(matches=[],diagnostics=[],elapsed_ms=0,version=VERSION)
+
+    matches=[]
+    diagnostics=[]
+    ambiguous=[]
+    for item in items[:6]:
+        try: cid=int(item.get("id"))
+        except Exception: continue
+        row=db.session.get(Link,cid)
+        if not row or not row.enabled: continue
+        emb=float(item.get("embedding_score",0) or 0)
+        text=float(item.get("text_score",0) or 0)
+        gok,dist=gps_ok(row,lat,lon)
+        f=row.fields()
+
+        # High-confidence shortcut.
+        # Text may be imperfect; visual embedding must still be strong.
+        direct=bool(gok and emb>=91.0 and text>=82.0)
+
+        d={
+            "id":row.id,
+            "registration_name":f["registration_name"],
+            "display_name":f["display_name"],
+            "links":[
+                {"title":row.link_title_1 or "열기","url":row.link_url_1 or row.url},
+                *([{"title":row.link_title_2,"url":row.link_url_2}] if row.link_url_2 else []),
+                *([{"title":row.link_title_3,"url":row.link_url_3}] if row.link_url_3 else []),
+            ],
+            "url":row.link_url_1 or row.url,
+            "embedding_score":round(emb,1),
+            "text_score":round(text,1),
+            "gps_ok":gok,
+            "distance_m":dist,
+            "decision":"EMBED_TEXT_DIRECT" if direct else "NEEDS_SIFT",
+            "passed":direct,
+            "final_confidence":round(min(99.0,emb*0.62+text*0.38),1) if direct else 0.0,
+        }
+        if direct:
+            matches.append(d)
+            diagnostics.append(d)
+        else:
+            ambiguous.append((row,d))
+
+    if ambiguous:
+        live_sift=prepare_live_sift(raw)
+        for row,d in ambiguous:
+            try:p=json.loads(row.identity_profile or "{}")
+            except Exception:p={}
+            fp=p.get("full_visual",{}).get("sift",{})
+            if not fp: fp=sift_fingerprint(row.reference_image)
+            sd=sift_homography_score_prepared(fp,live_sift)
+            visual=float(sd.get("score",0) or 0)
+            text=float(d["text_score"])
+            emb=float(d["embedding_score"])
+
+            # Dynamic threshold:
+            # strong text lowers required SIFT; weak text requires stronger SIFT.
+            if text>=88: required=78.0
+            elif text>=72: required=84.0
+            else: required=92.0
+
+            geometry_ok=bool(
+                sd.get("homography")
+                and int(sd.get("inliers",0) or 0)>=16
+                and float(sd.get("inlier_ratio",0) or 0)>=0.62
+                and float(sd.get("coverage",0) or 0)>=0.10
+            )
+            passed=bool(d["gps_ok"] and geometry_ok and visual>=required and emb>=58.0)
+            final=visual*0.50+emb*0.28+text*0.22
+
+            d.update({
+                "decision":"SIFT_FALLBACK",
+                "visual_score":round(visual,1),
+                "required_visual_score":required,
+                "sift_good_matches":sd.get("good_matches",0),
+                "sift_inliers":sd.get("inliers",0),
+                "sift_inlier_ratio":sd.get("inlier_ratio",0),
+                "sift_coverage":sd.get("coverage",0),
+                "sift_median_error":sd.get("median_error"),
+                "passed":passed,
+                "final_confidence":round(final,1),
+            })
+            diagnostics.append(d)
+            if passed: matches.append(d)
+
+    matches.sort(key=lambda q:q["final_confidence"],reverse=True)
+    elapsed=int((time.perf_counter()-started)*1000)
+    return jsonify(matches=matches,diagnostics=diagnostics,elapsed_ms=elapsed,version=VERSION)
 
 
 @app.post("/api/qr_fast_verify")
