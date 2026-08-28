@@ -29,7 +29,7 @@ app.config["MAX_CONTENT_LENGTH"] = 15 * 1024 * 1024
 
 db = SQLAlchemy(app)
 ADMIN_KEY = os.getenv("ADMIN_KEY", "change-me")
-VERSION = "0.8.2.3"
+VERSION = "0.8.2.4"
 
 
 class Link(db.Model):
@@ -1617,7 +1617,7 @@ def candidate_score(ocr_texts,row):
 
 
 REGISTRY_SCHEMA_VERSION=1
-REGISTRY_ANALYSIS_VERSION="0823-registry-v1-sift-roi"
+REGISTRY_ANALYSIS_VERSION="0824-registry-v1-sift-roi"
 
 def source_hash(raw):
     return hashlib.sha256(raw or b"").hexdigest()
@@ -2082,6 +2082,78 @@ def row_text_evidence(row,live_texts):
         "source":"TEXT_FUZZY" if best>=38 else "NONE"
     }
 
+
+def _norm_live_ocr_regions(items, frame_width=None, frame_height=None):
+    """Normalize client OCR boxes to 0..1 frame coordinates."""
+    out=[]
+    fw=float(frame_width or 0)
+    fh=float(frame_height or 0)
+    for it in (items or []):
+        if not isinstance(it,dict): continue
+        t=str(it.get("text") or "").strip()
+        if not t: continue
+        try:
+            x0=float(it.get("x0",0)); y0=float(it.get("y0",0))
+            x1=float(it.get("x1",0)); y1=float(it.get("y1",0))
+        except Exception:
+            continue
+        # Android sends pixel boxes. Also tolerate already-normalized boxes.
+        if fw>1 and (x1>1.0 or x0>1.0):
+            x0/=fw; x1/=fw
+        if fh>1 and (y1>1.0 or y0>1.0):
+            y0/=fh; y1/=fh
+        x0=max(0.0,min(1.0,x0)); y0=max(0.0,min(1.0,y0))
+        x1=max(0.0,min(1.0,x1)); y1=max(0.0,min(1.0,y1))
+        if x1<=x0 or y1<=y0: continue
+        out.append({"text":t,"x0":x0,"y0":y0,"x1":x1,"y1":y1})
+    return out
+
+def _ocr_region_belongs_to_roi(r, roi):
+    """
+    Text belongs to a visual object only when its OCR box is spatially tied to
+    the SIFT target ROI. A modest expansion tolerates OCR/SIFT boundary mismatch.
+    """
+    if not roi: return False
+    try:
+        rx=float(roi.get("x",0)); ry=float(roi.get("y",0))
+        rw=float(roi.get("w",0)); rh=float(roi.get("h",0))
+    except Exception:
+        return False
+    if rw<=0 or rh<=0: return False
+
+    # Expand target ROI by 28% of each side, with a small absolute floor.
+    mx=max(0.025,rw*0.28)
+    my=max(0.025,rh*0.28)
+    ax0=max(0.0,rx-mx); ay0=max(0.0,ry-my)
+    ax1=min(1.0,rx+rw+mx); ay1=min(1.0,ry+rh+my)
+
+    x0=float(r["x0"]); y0=float(r["y0"])
+    x1=float(r["x1"]); y1=float(r["y1"])
+    cx=(x0+x1)/2.0; cy=(y0+y1)/2.0
+    center_inside=(ax0<=cx<=ax1 and ay0<=cy<=ay1)
+
+    ix=max(0.0,min(x1,ax1)-max(x0,ax0))
+    iy=max(0.0,min(y1,ay1)-max(y0,ay0))
+    inter=ix*iy
+    area=max(1e-9,(x1-x0)*(y1-y0))
+    overlap=inter/area
+
+    return bool(center_inside or overlap>=0.35)
+
+def spatial_row_text_evidence(row, live_ocr_regions, target_roi):
+    """
+    Candidate-specific text evidence.
+    Whole-frame OCR may retrieve a candidate, but only text located at the
+    candidate's SIFT ROI is allowed to lower its final visual threshold.
+    """
+    bound=[r for r in (live_ocr_regions or []) if _ocr_region_belongs_to_roi(r,target_roi)]
+    texts=[r["text"] for r in bound]
+    te=row_text_evidence(row,texts)
+    te["bound_region_count"]=len(bound)
+    te["bound_texts"]=texts[:12]
+    te["spatial_bound"]=bool(bound and te.get("score",0)>=38.0)
+    return te
+
 def one_frame_decision(text_score,exact,visual_score,sd,embedding_score):
     """Evidence-combination decision. Embedding never vetoes."""
     hom=bool(sd.get("homography"))
@@ -2124,6 +2196,11 @@ def resolve_frame():
     x=request.get_json(silent=True) or {}
     raw=b64_bytes(x.get("image_base64"))
     live_texts=x.get("texts") or []
+    frame_width=x.get("frame_width")
+    frame_height=x.get("frame_height")
+    live_ocr_regions=_norm_live_ocr_regions(
+        x.get("ocr_regions") or [], frame_width, frame_height
+    )
     lat,lon=x.get("lat"),x.get("lon")
     if not raw:
         return jsonify(matches=[],diagnostics=[],elapsed_ms=0,reason="NO_IMAGE",version=VERSION)
@@ -2172,17 +2249,33 @@ def resolve_frame():
 
         sd=sift_homography_score_prepared(fp,live_sift)
         visual=float(sd.get("score",0) or 0)
+
+        # V0.8.2.4 SPATIAL BINDING:
+        # global TE is retrieval-only. Final decision receives text evidence only
+        # from OCR boxes spatially tied to this candidate's SIFT ROI.
+        te_global=te
+        te_spatial=spatial_row_text_evidence(
+            row,live_ocr_regions,sd.get("target_roi")
+        )
+        te_final=te_spatial if te_spatial.get("spatial_bound") else {
+            "score":0.0,"exact":False,"live":"","hint":"",
+            "source":"TEXT_OUTSIDE_TARGET_ROI",
+            "bound_region_count":te_spatial.get("bound_region_count",0),
+            "bound_texts":te_spatial.get("bound_texts",[]),
+            "spatial_bound":False,
+        }
+
         passed,reason,required=one_frame_decision(
-            float(te["score"]),bool(te["exact"]),visual,sd,emb
+            float(te_final["score"]),bool(te_final["exact"]),visual,sd,emb
         )
         passed=bool(passed and gok)
 
         f=row.fields()
-        # confidence reflects evidence but is not used as a single cut-off.
-        if te["exact"]:
+        # confidence uses the same spatially-bound text evidence as PASS/FAIL.
+        if te_final["exact"]:
             final=min(99.0,visual*0.55+100.0*0.45)
-        elif te["score"]>=65:
-            final=min(99.0,visual*0.62+float(te["score"])*0.38)
+        elif te_final["score"]>=65:
+            final=min(99.0,visual*0.62+float(te_final["score"])*0.38)
         else:
             final=min(99.0,visual*0.82+emb*0.18)
 
@@ -2196,11 +2289,19 @@ def resolve_frame():
                 *([{"title":row.link_title_3,"url":row.link_url_3}] if row.link_url_3 else []),
             ],
             "url":row.link_url_1 or row.url,
-            "text_score":te["score"],
-            "text_exact":te["exact"],
-            "text_live":te["live"],
-            "text_hint":te["hint"],
-            "text_source":te["source"],
+            "text_score":te_final["score"],
+            "text_exact":te_final["exact"],
+            "text_live":te_final["live"],
+            "text_hint":te_final["hint"],
+            "text_source":te_final["source"],
+            "text_spatial_bound":bool(te_final.get("spatial_bound")),
+            "text_bound_region_count":te_final.get("bound_region_count",0),
+            "text_bound_texts":te_final.get("bound_texts",[]),
+            "global_text_score":te_global["score"],
+            "global_text_exact":te_global["exact"],
+            "global_text_live":te_global["live"],
+            "global_text_hint":te_global["hint"],
+            "global_text_source":te_global["source"],
             "embedding_score":round(emb,1),
             "visual_score":round(visual,1),
             "required_visual_score":required,
@@ -2230,6 +2331,8 @@ def resolve_frame():
         candidate_count=len(candidates),
         candidate_mode=candidate_mode,
         frame_mode="FULL_SELECTED_FRAME",
+        text_binding_mode="SIFT_ROI_SPATIAL_V1",
+        ocr_region_count=len(live_ocr_regions),
         elapsed_ms=elapsed,
         version=VERSION
     )
