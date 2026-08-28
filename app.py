@@ -28,7 +28,7 @@ app.config["MAX_CONTENT_LENGTH"] = 15 * 1024 * 1024
 
 db = SQLAlchemy(app)
 ADMIN_KEY = os.getenv("ADMIN_KEY", "change-me")
-VERSION = "0.8.1.6"
+VERSION = "0.8.2.0"
 
 
 class Link(db.Model):
@@ -1785,6 +1785,251 @@ def candidates():
 
 
 
+
+
+
+# -------------------------- V0.8.2.0 one-frame evidence resolver --------------------------
+def _norm_match_text(v):
+    return "".join(ch.lower() for ch in str(v or "") if ch.isalnum() or ("가"<=ch<="힣"))
+
+def _lev_score(a,b):
+    a=_norm_match_text(a); b=_norm_match_text(b)
+    if not a or not b:return 0.0
+    if a==b:return 100.0
+    prev=list(range(len(b)+1))
+    for i,ca in enumerate(a,1):
+        cur=[i]
+        for j,cb in enumerate(b,1):
+            cur.append(min(cur[-1]+1,prev[j]+1,prev[j-1]+(0 if ca==cb else 1)))
+        prev=cur
+    dist=prev[-1]
+    return max(0.0,100.0*(1.0-dist/max(len(a),len(b))))
+
+def _dice_score(a,b,n=2):
+    a=_norm_match_text(a); b=_norm_match_text(b)
+    if not a or not b:return 0.0
+    if a==b:return 100.0
+    if len(a)<n or len(b)<n:return _lev_score(a,b)
+    aa=[a[i:i+n] for i in range(len(a)-n+1)]
+    bb=[b[i:i+n] for i in range(len(b)-n+1)]
+    from collections import Counter
+    ca,cb=Counter(aa),Counter(bb)
+    inter=sum((ca&cb).values())
+    return 200.0*inter/max(1,len(aa)+len(bb))
+
+def _text_pair_score(a,b):
+    na=_norm_match_text(a); nb=_norm_match_text(b)
+    if len(na)<2 or len(nb)<2:return 0.0
+    if na==nb:return 100.0
+    short=min(len(na),len(nb))
+    contain=0.0
+    if na in nb or nb in na:
+        contain=96.0 if short>=5 else 90.0 if short>=4 else 82.0
+    return max(_lev_score(na,nb),_dice_score(na,nb),contain)
+
+def _row_text_hints(row):
+    f=row.fields()
+    hints=[f.get("registration_name",""),f.get("display_name",""),row.hint_text or ""]
+    try:
+        p=json.loads(row.identity_profile or "{}")
+    except Exception:
+        p={}
+    ctx=p.get("context",{}) or {}
+    hints += list(ctx.get("recognition_terms",[]) or [])
+    hints += list(ctx.get("image_ocr_terms",[]) or [])
+    out=[]
+    for h in hints:
+        if not h:continue
+        # preserve whole phrase and split configured hint delimiters
+        out.append(str(h))
+        out += [x.strip() for x in re.split(r"[/,|\\n]+",str(h)) if x.strip()]
+    # normalized-dedupe
+    seen=set(); uniq=[]
+    for h in out:
+        k=_norm_match_text(h)
+        if len(k)<2 or k in seen:continue
+        seen.add(k);uniq.append(h)
+    return uniq
+
+def _expand_live_texts(texts):
+    base=[str(x).strip() for x in (texts or []) if len(_norm_match_text(x))>=2]
+    out=list(base)
+    # Adjacent OCR lines/words can form one registered title:
+    # Winning + Habit => WinningHabit
+    for i in range(len(base)):
+        for span in (2,3):
+            if i+span<=len(base):
+                seg=base[i:i+span]
+                out.append(" ".join(seg))
+                out.append("".join(seg))
+    # Also combine short title-like tokens independent of OCR line break.
+    shorts=[x for x in base if 2<=len(_norm_match_text(x))<=20]
+    for i in range(min(len(shorts),12)):
+        for j in range(i+1,min(len(shorts),12)):
+            out.append(shorts[i]+" "+shorts[j])
+            out.append(shorts[i]+shorts[j])
+    seen=set(); uniq=[]
+    for t in out:
+        k=_norm_match_text(t)
+        if len(k)<2 or k in seen:continue
+        seen.add(k);uniq.append(t)
+    return uniq[:120]
+
+def row_text_evidence(row,live_texts):
+    hints=_row_text_hints(row)
+    expanded=_expand_live_texts(live_texts)
+    best=0.0; best_live=""; best_hint=""; exact=False
+    for t in expanded:
+        nt=_norm_match_text(t)
+        for h in hints:
+            nh=_norm_match_text(h)
+            if not nt or not nh:continue
+            if nt==nh:
+                return {
+                    "score":100.0,"exact":True,
+                    "live":t,"hint":h,"source":"TEXT_EXACT"
+                }
+            sc=_text_pair_score(t,h)
+            if sc>best:
+                best=sc;best_live=t;best_hint=h
+    return {
+        "score":round(best,1),
+        "exact":False,
+        "live":best_live,
+        "hint":best_hint,
+        "source":"TEXT_FUZZY" if best>=38 else "NONE"
+    }
+
+def one_frame_decision(text_score,exact,visual_score,sd,embedding_score):
+    """Evidence-combination decision. Embedding never vetoes."""
+    hom=bool(sd.get("homography"))
+    inliers=int(sd.get("inliers",0) or 0)
+    ratio=float(sd.get("inlier_ratio",0) or 0)
+    coverage=float(sd.get("coverage",0) or 0)
+    err=sd.get("median_error")
+    err=float(err) if err is not None else 99.0
+
+    # geometry levels
+    geo_basic=hom and inliers>=12 and ratio>=0.52 and coverage>=0.07 and err<=4.0
+    geo_mid=hom and inliers>=18 and ratio>=0.58 and coverage>=0.10 and err<=3.2
+    geo_strong=hom and inliers>=28 and ratio>=0.68 and coverage>=0.16 and err<=2.5
+
+    if exact and geo_basic and visual_score>=68:
+        return True,"TEXT_EXACT_PLUS_VISUAL",68.0
+    if text_score>=90 and geo_basic and visual_score>=72:
+        return True,"TEXT_STRONG_PLUS_VISUAL",72.0
+    if text_score>=80 and geo_mid and visual_score>=76:
+        return True,"TEXT_VISUAL_BALANCED",76.0
+    if text_score>=65 and geo_mid and visual_score>=82:
+        return True,"TEXT_PARTIAL_PLUS_VISUAL",82.0
+    if text_score<65 and geo_strong and visual_score>=91:
+        return True,"VISUAL_ONLY_STRONG",91.0
+    return False,"EVIDENCE_INSUFFICIENT",(
+        68.0 if exact else 72.0 if text_score>=90 else
+        76.0 if text_score>=80 else 82.0 if text_score>=65 else 91.0
+    )
+
+@app.post("/api/resolve_frame")
+def resolve_frame():
+    """
+    ONE GOOD FRAME -> ONE SERVER REQUEST -> FINAL DECISION.
+
+    The server itself computes candidate text evidence, visual retrieval and SIFT.
+    This prevents client-side registry-cache failures from turning an exact OCR
+    hit into text_score=0, and removes the extra visual-candidate roundtrip.
+    """
+    started=time.perf_counter()
+    x=request.get_json(silent=True) or {}
+    raw=b64_bytes(x.get("image_base64"))
+    live_texts=x.get("texts") or []
+    lat,lon=x.get("lat"),x.get("lon")
+    if not raw:
+        return jsonify(matches=[],diagnostics=[],elapsed_ms=0,reason="NO_IMAGE",version=VERSION)
+
+    # Compute LIVE features once.
+    live_emb=visual_embedding(raw)
+    live_sift=prepare_live_sift(raw)
+
+    rows=Link.query.filter_by(enabled=True).all()
+    candidates=[]
+    for row in rows:
+        te=row_text_evidence(row,live_texts)
+        emb=visual_embedding_similarity(_profile_visual_embedding(row),live_emb)
+        # Candidate entry is deliberately broad. Final pass is SIFT evidence-combination.
+        if te["score"]>=38.0 or emb>=28.0:
+            candidates.append((row,te,float(emb)))
+
+    # Text evidence first, visual retrieval second.
+    candidates.sort(key=lambda q:(q[1]["score"],q[2]),reverse=True)
+    candidates=candidates[:8]
+
+    matches=[]; diagnostics=[]
+    for row,te,emb in candidates:
+        gok,dist=gps_ok(row,lat,lon)
+        try:p=json.loads(row.identity_profile or "{}")
+        except Exception:p={}
+        fp=p.get("full_visual",{}).get("sift",{})
+        if not fp:
+            fp=sift_fingerprint(row.reference_image)
+
+        sd=sift_homography_score_prepared(fp,live_sift)
+        visual=float(sd.get("score",0) or 0)
+        passed,reason,required=one_frame_decision(
+            float(te["score"]),bool(te["exact"]),visual,sd,emb
+        )
+        passed=bool(passed and gok)
+
+        f=row.fields()
+        # confidence reflects evidence but is not used as a single cut-off.
+        if te["exact"]:
+            final=min(99.0,visual*0.55+100.0*0.45)
+        elif te["score"]>=65:
+            final=min(99.0,visual*0.62+float(te["score"])*0.38)
+        else:
+            final=min(99.0,visual*0.82+emb*0.18)
+
+        d={
+            "id":row.id,
+            "registration_name":f["registration_name"],
+            "display_name":f["display_name"],
+            "links":[
+                {"title":row.link_title_1 or "열기","url":row.link_url_1 or row.url},
+                *([{"title":row.link_title_2,"url":row.link_url_2}] if row.link_url_2 else []),
+                *([{"title":row.link_title_3,"url":row.link_url_3}] if row.link_url_3 else []),
+            ],
+            "url":row.link_url_1 or row.url,
+            "text_score":te["score"],
+            "text_exact":te["exact"],
+            "text_live":te["live"],
+            "text_hint":te["hint"],
+            "text_source":te["source"],
+            "embedding_score":round(emb,1),
+            "visual_score":round(visual,1),
+            "required_visual_score":required,
+            "sift_good_matches":sd.get("good_matches",0),
+            "sift_inliers":sd.get("inliers",0),
+            "sift_inlier_ratio":sd.get("inlier_ratio",0),
+            "sift_coverage":sd.get("coverage",0),
+            "sift_median_error":sd.get("median_error"),
+            "decision_reason":reason,
+            "gps_ok":gok,
+            "distance_m":dist,
+            "passed":passed,
+            "final_confidence":round(final,1),
+        }
+        diagnostics.append(d)
+        if passed:matches.append(d)
+
+    matches.sort(key=lambda q:q["final_confidence"],reverse=True)
+    diagnostics.sort(key=lambda q:(q["passed"],q["final_confidence"]),reverse=True)
+    elapsed=int((time.perf_counter()-started)*1000)
+    return jsonify(
+        matches=matches,
+        diagnostics=diagnostics,
+        candidate_count=len(candidates),
+        elapsed_ms=elapsed,
+        version=VERSION
+    )
 
 
 @app.post("/api/visual_candidates")
