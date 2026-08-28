@@ -3,6 +3,7 @@ import time
 from functools import lru_cache
 import difflib
 import json
+import hashlib
 import math
 import os
 import re
@@ -28,7 +29,7 @@ app.config["MAX_CONTENT_LENGTH"] = 15 * 1024 * 1024
 
 db = SQLAlchemy(app)
 ADMIN_KEY = os.getenv("ADMIN_KEY", "change-me")
-VERSION = "0.8.2.0"
+VERSION = "0.8.2.2"
 
 
 class Link(db.Model):
@@ -66,6 +67,17 @@ class Link(db.Model):
 
     visual_threshold = db.Column(db.Float, nullable=False, default=48.0)
     identity_profile = db.Column(db.Text)
+
+    # Registry V1: durable human/source data + replaceable analysis data.
+    schema_version = db.Column(db.Integer, nullable=False, default=1)
+    analysis_version = db.Column(db.String(80), nullable=False, default="registry-v1")
+    original_filename = db.Column(db.String(500), nullable=False, default="")
+    source_sha256 = db.Column(db.String(64), nullable=False, default="")
+    updated_at = db.Column(db.DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc))
+    deleted_at = db.Column(db.DateTime(timezone=True))
+
     created_at = db.Column(
         db.DateTime(timezone=True),
         nullable=False,
@@ -121,6 +133,11 @@ class Link(db.Model):
                 "sift_features": profile.get("full_visual", {}).get("sift", {}).get("count", 0),
                 "ocr_ready": bool(profile.get("text_identity", [])),
             },
+            "schema_version": int(self.schema_version or 1),
+            "analysis_version": self.analysis_version or "",
+            "original_filename": self.original_filename or "",
+            "source_sha256": self.source_sha256 or "",
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
 
@@ -1154,6 +1171,7 @@ def prepare_live_sift(frame_raw):
         "points":np.float32([k.pt for k in k2]),
         "descriptors":d2.astype(np.float32),
         "count":len(k2),
+        "shape":frame.shape[:2],
     }
 
 def sift_homography_score_prepared(fp,live):
@@ -1227,6 +1245,29 @@ def sift_homography_score_prepared(fp,live):
     if inliers>=30 and inlier_ratio>=0.80 and median_error<=2.0:
         score=max(score,88.0)
 
+    # Target ROI in the LIVE frame, derived from inlier points.
+    # This is target coverage/location, not generic frame sharpness.
+    roi=None
+    target_area_pct=0.0
+    inlier_live=dst_pts.reshape(-1,2)[inlier_mask]
+    live_shape=live.get("shape")
+    if len(inlier_live)>=3 and live_shape:
+        lh,lw=int(live_shape[0]),int(live_shape[1])
+        x1=max(0.0,float(inlier_live[:,0].min()))
+        y1=max(0.0,float(inlier_live[:,1].min()))
+        x2=min(float(lw),float(inlier_live[:,0].max()))
+        y2=min(float(lh),float(inlier_live[:,1].max()))
+        # Small padding makes the diagnostic ROI closer to the visible object.
+        px=(x2-x1)*0.10; py=(y2-y1)*0.10
+        x1=max(0.0,x1-px); y1=max(0.0,y1-py)
+        x2=min(float(lw),x2+px); y2=min(float(lh),y2+py)
+        if x2>x1 and y2>y1:
+            target_area_pct=100.0*((x2-x1)*(y2-y1))/max(1.0,float(lw*lh))
+            roi={
+                "x":round(x1/lw,4),"y":round(y1/lh,4),
+                "w":round((x2-x1)/lw,4),"h":round((y2-y1)/lh,4)
+            }
+
     return {
         "score":round(min(100.0,score),1),
         "good_matches":int(len(good)),
@@ -1235,6 +1276,8 @@ def sift_homography_score_prepared(fp,live):
         "median_error":round(median_error,2),
         "coverage":round(coverage,3),
         "homography":True,
+        "target_roi":roi,
+        "target_area_pct":round(target_area_pct,1),
     }
 
 
@@ -1572,72 +1615,75 @@ def candidate_score(ocr_texts,row):
     }
 
 
+
+REGISTRY_SCHEMA_VERSION=1
+REGISTRY_ANALYSIS_VERSION="0822-registry-v1-sift-roi"
+
+def source_hash(raw):
+    return hashlib.sha256(raw or b"").hexdigest()
+
+def registration_draft_from_ocr(items):
+    rows=[]
+    for it in normalize_detected_texts(items):
+        t=re.sub(r"\s+"," ",str(it.get("text",""))).strip(" |·_-")
+        if len(norm(t))<2: continue
+        b=it.get("bbox") or {}
+        area=max(1,(b.get("x1",0)-b.get("x0",0))*(b.get("y1",0)-b.get("y0",0)))
+        conf=float(it.get("confidence",0) or 0)
+        ui_noise=bool(re.search(r"\.(jpg|jpeg|png|webp)|\b\d+(kb|mb|gb)\b|^f\d+$",t,re.I))
+        score=min(len(norm(t)),24)*2.0+conf*.35+math.log10(area+10)*7.0-(45 if ui_noise else 0)
+        rows.append((score,t))
+    rows.sort(reverse=True)
+    texts=[]; seen=set()
+    for _,t in rows:
+        k=_norm_match_text(t)
+        if not k or k in seen: continue
+        seen.add(k); texts.append(t)
+    primary=texts[0] if texts else ""
+    hint=[]
+    for t in texts[:8]:
+        hint.append(t)
+        n=_norm_match_text(t)
+        if n and n!=t.lower(): hint.append(n)
+    hint=list(dict.fromkeys(x for x in hint if x))[:12]
+    return {"registration_name":primary,"display_name":primary[:120],
+            "hint_text":" / ".join(hint),"ocr_ranked":texts[:12]}
+
+def persistence_status():
+    backend=db.engine.url.get_backend_name()
+    render=bool(os.getenv("RENDER"))
+    durable=backend.startswith("postgres") or not render
+    return {"backend":backend,"durable":durable,
+            "warning":"" if durable else "Render에서 SQLite는 재배포 시 데이터가 사라질 수 있습니다. DATABASE_URL(PostgreSQL)을 연결하세요."}
+
 # -------------------------- routes --------------------------
 
-INDEX_HTML = r"""<!doctype html>
-<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>LUPER Registry V0.8.0.9</title>
-<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
-<style>
-body{font-family:system-ui,-apple-system,sans-serif;background:#f5f6f8;margin:0;color:#17191c}.w{max-width:1180px;margin:22px auto;padding:0 15px}.c{background:#fff;border:1px solid #ddd;border-radius:14px;padding:18px;margin:13px 0}.g{display:grid;grid-template-columns:1fr 1fr;gap:12px}.full{grid-column:1/-1}label{display:block;font-size:13px;color:#555;margin-bottom:5px}input{width:100%;box-sizing:border-box;padding:10px;border:1px solid #ccd1d7;border-radius:8px}button{border:0;border-radius:8px;background:#111;color:#fff;font-weight:700;padding:9px 12px;cursor:pointer}.danger{background:#a51d27}.ghost{background:#555}.muted{font-size:13px;color:#666}.ok{color:#18723a;font-weight:700}.warn{color:#a22;font-weight:700}table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:8px;border-bottom:1px solid #eee;text-align:left;vertical-align:top}.profile{white-space:pre-wrap;font:12px/1.55 ui-monospace,monospace;background:#101114;color:#eee;padding:11px;border-radius:8px;max-height:420px;overflow:auto}.preview{display:flex;gap:12px;flex-wrap:wrap}.preview img{max-width:330px;max-height:210px;border:1px solid #ddd;border-radius:8px}.identity{display:grid;grid-template-columns:135px 100px 1fr 180px;gap:5px;font-size:12px;border-bottom:1px solid #eee;padding:7px 0}.modal{display:none;position:fixed;inset:0;background:#0008;z-index:30;padding:30px;overflow:auto}.modalbox{max-width:1050px;margin:auto;background:#fff;border-radius:14px;padding:18px}@media(max-width:820px){.g{grid-template-columns:1fr}.full{grid-column:auto}.identity{grid-template-columns:1fr}table{display:block;overflow:auto}}
-</style></head><body><div class="w">
-<h2>LUPER Registry V0.8.0.9</h2>
-<p><b>Context Hint + 실제 이미지 OCR + Layout/Color + SIFT</b></p>
-<p class="muted">등록명·표시명은 힌트입니다. 등록 이미지에서 한글+영문을 실제로 읽어 Winning Habit 같은 문구도 후보어로 저장합니다.</p>
-<div class="c"><label>관리자 키</label><div style="display:flex;gap:8px"><input id="admin" type="password"><button id="saveKey">키 저장</button></div></div>
-<div class="c"><form id="f"><div class="g">
-<div><label>등록명 · 분석 힌트</label><input id="regname" required placeholder="이기는 습관 샘앤파커스"></div>
-<div><label>표시명 · 링크카드 표시</label><input id="display" required placeholder="이기는 습관"></div>
-<div class="full"><label>힌트 · 후보 검색 보조</label><input id="hint" placeholder="예: 이기는 습관 / Winning Habit / 샘앤파커스"></div>
-<div><label>링크 1 타이틀</label><input id="linktitle1" required placeholder="예: 책 소개"></div>
-<div><label>링크 1 URL</label><input id="linkurl1" required placeholder="https://..."></div>
-<div><label>링크 2 타이틀</label><input id="linktitle2" placeholder="예: 구매하기"></div>
-<div><label>링크 2 URL</label><input id="linkurl2" placeholder="https://..."></div>
-<div><label>링크 3 타이틀</label><input id="linktitle3" placeholder="예: 출판사"></div>
-<div><label>링크 3 URL</label><input id="linkurl3" placeholder="https://..."></div>
-<div class="full"><label>기준 이미지</label><input id="fullImg" type="file" accept="image/*" required></div>
-<div class="full"><div id="ocrState" class="muted">사전분석 시 한글+영문 OCR을 실행합니다.</div></div>
-<div class="full" style="display:flex;gap:8px"><button type="button" id="analyze">이미지 사전분석</button><button type="submit">분석 결과로 등록</button></div>
-</div></form></div>
-<div class="c"><h3>이미지 사전분석</h3><div id="analysis" class="muted">아직 분석하지 않았습니다.</div><div id="previews" class="preview"></div></div>
-<div class="c"><h3>등록목록</h3><div id="state"></div><div id="list"></div></div>
-<div class="c"><h3>최근 LIVE TRACE</h3><button onclick="loadTraces()">최근 50건</button><div id="traces" class="profile">TRACE 대기</div></div>
-</div>
-<div id="modal" class="modal"><div class="modalbox"><div style="display:flex;justify-content:space-between"><h3 id="modalTitle">분석보기</h3><button class="ghost" onclick="closeModal()">닫기</button></div><div id="modalImage" class="preview"></div><div id="modalBody"></div></div></div>
+INDEX_HTML = r"""<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>LUPER Registry V0.8.2.2</title><script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+<style>body{font-family:system-ui;background:#f5f6f8;margin:0;color:#17191c}.w{max-width:1180px;margin:22px auto;padding:0 15px}.c{background:white;border:1px solid #ddd;border-radius:14px;padding:18px;margin:13px 0}.g{display:grid;grid-template-columns:1fr 1fr;gap:12px}.full{grid-column:1/-1}label{display:block;font-size:13px;color:#555;margin-bottom:5px}input{width:100%;box-sizing:border-box;padding:10px;border:1px solid #ccd1d7;border-radius:8px}button{border:0;border-radius:8px;background:#111;color:#fff;font-weight:700;padding:10px 14px;cursor:pointer}.ghost{background:#666}.danger{background:#a51d27}.muted{font-size:13px;color:#666}.ok{color:#18723a;font-weight:700}.warn{color:#a22;font-weight:700}.step{font-weight:800;margin-bottom:10px}table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:8px;border-bottom:1px solid #eee;text-align:left;vertical-align:top}.profile{white-space:pre-wrap;font:12px/1.55 monospace;background:#101114;color:#eee;padding:11px;border-radius:8px;max-height:420px;overflow:auto}.preview img{max-width:360px;max-height:230px;border:1px solid #ddd;border-radius:8px}@media(max-width:820px){.g{grid-template-columns:1fr}.full{grid-column:auto}}</style></head>
+<body><div class="w"><h2>LUPER Registry V0.8.2.2 · Registry V1</h2><p class="muted">원본/사람 확정 데이터는 유지하고 OCR·SIFT·ROI 등 분석 데이터만 버전별로 재생성합니다.</p>
+<div class="c"><label>관리자 키</label><div style="display:flex;gap:8px"><input id="admin" type="password"><button id="saveKey">키 저장</button></div><div id="persist" class="muted"></div></div>
+<div class="c"><div class="step">1. 이미지 먼저 선택하고 분석</div><input id="fullImg" type="file" accept="image/*"><div id="ocrState" class="muted" style="margin:8px 0">이미지를 선택하세요.</div><button id="analyze">이미지 분석</button><div id="analysis" class="muted" style="margin-top:12px">아직 분석하지 않았습니다.</div><div id="previews" class="preview"></div></div>
+<div class="c"><div class="step">2. 자동 초안 확인 · 수정 가능</div><div class="g"><div><label>등록명 · 분석/관리 기준</label><input id="regname"></div><div><label>표시명 · 링크카드 표시</label><input id="display"></div><div class="full"><label>힌트 · 후보 검색 보조</label><input id="hint"></div></div></div>
+<div class="c"><div class="step">3. 링크 입력 후 최종 등록</div><form id="f"><div class="g"><div><label>링크1 타이틀</label><input id="linktitle1"></div><div><label>링크1 URL</label><input id="linkurl1"></div><div><label>링크2 타이틀</label><input id="linktitle2"></div><div><label>링크2 URL</label><input id="linkurl2"></div><div><label>링크3 타이틀</label><input id="linktitle3"></div><div><label>링크3 URL</label><input id="linkurl3"></div><div class="full"><button type="submit">최종 등록</button> <button type="button" class="ghost" id="resetBtn">입력 초기화</button></div></div></form></div>
+<div class="c"><h3>등록목록</h3><div id="state"></div><button class="ghost" id="reanalyzeOld">구버전 분석만 일괄 재분석</button><div id="list"></div></div>
+<div class="c"><h3>최근 LIVE TRACE</h3><button onclick="loadTraces()">최근 50건</button><div id="traces" class="profile">TRACE 대기</div></div></div>
 <script>
 const $=id=>document.getElementById(id),esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-$('admin').value=sessionStorage.getItem('luper_admin')||'';$('saveKey').onclick=()=>{sessionStorage.setItem('luper_admin',$('admin').value);refresh()};const ah=()=>({'X-Admin-Key':$('admin').value});
+$('admin').value=sessionStorage.getItem('luper_admin')||'';const ah=()=>({'X-Admin-Key':$('admin').value});$('saveKey').onclick=()=>{sessionStorage.setItem('luper_admin',$('admin').value);refresh()};
 function file64(f){return new Promise((ok,no)=>{if(!f)return ok(null);let r=new FileReader();r.onload=()=>ok(r.result);r.onerror=no;r.readAsDataURL(f)})}
-let ocrCache={fileKey:'',items:[]},ocrWorker=null;function fileKey(f){return f?`${f.name}:${f.size}:${f.lastModified}`:''}
-async function ensureOcrWorker(){if(ocrWorker)return ocrWorker;$('ocrState').textContent='OCR 엔진 준비 중… 최초 1회 언어데이터 로딩';ocrWorker=await Tesseract.createWorker(['kor','eng'],1,{logger:m=>{if(m.status)$('ocrState').textContent=`OCR ${m.status} ${Math.round((m.progress||0)*100)}%`}});return ocrWorker}
-async function browserOcr(){const f=$('fullImg').files[0];if(!f)return[];const key=fileKey(f);if(ocrCache.fileKey===key&&ocrCache.items.length)return ocrCache.items;const w=await ensureOcrWorker();$('ocrState').textContent='한글+영문 실제 문자를 읽는 중…';const r=await w.recognize(f);const lines=(r.data.lines&&r.data.lines.length?r.data.lines:r.data.words)||[];const items=lines.filter(x=>x.text&&String(x.text).trim().length>1&&x.bbox).map(x=>({text:String(x.text).trim(),confidence:Number(x.confidence||0),bbox:{x0:x.bbox.x0,y0:x.bbox.y0,x1:x.bbox.x1,y1:x.bbox.y1}}));ocrCache={fileKey:key,items};$('ocrState').textContent=`OCR 완료 · ${items.length}개 문자영역`;return items}
-async function payload(){
- const links=[
-   {title:$('linktitle1').value.trim(),url:$('linkurl1').value.trim()},
-   {title:$('linktitle2').value.trim(),url:$('linkurl2').value.trim()},
-   {title:$('linktitle3').value.trim(),url:$('linkurl3').value.trim()}
- ].filter(x=>x.url);
- return{
-   registration_name:$('regname').value.trim(),
-   display_name:$('display').value.trim(),
-   hint_text:$('hint').value.trim(),
-   url:links.length?links[0].url:'',
-   links,
-   reference_image_base64:await file64($('fullImg').files[0]),
-   detected_texts:await browserOcr()
- };
-}
-function paletteText(p){return(p?.dominant||[]).map(x=>`${x.family} ${x.percent}%`).join(' / ')}
-function identityHtml(rows){if(!rows?.length)return'<p class="warn">이미지 OCR Identity 없음 · 재등록 권장</p>';return rows.slice(0,20).map(r=>`<div class="identity"><b>${esc(r.text)}</b><span>${esc(r.script)} · ${esc(r.role)}<br>${r.text_likeness_passed?'✅ 문자성':'❌ 비문자'} ${esc(r.text_likeness_score)}점<br>${esc(r.text_likeness_reason||'')}<br>${r.size_gate_passed?'✅ 크기':'❌ 크기제외'} · 높이 ${esc(r.height_pct)}%<br>${esc(r.size_gate_reason||'')}</span><span>x ${r.position.x_pct}% / y ${r.position.y_pct}% / 가로 ${r.position.width_pct}% / 세로 ${r.position.height_pct}%<br>글자형태 ${esc(JSON.stringify(r.font_estimate?.top))}</span><span>${esc(paletteText(r.color))}</span></div>`).join('')}
-$('analyze').onclick=async()=>{if(!$('admin').value)return alert('관리자 키를 저장하세요.');const b=await payload();$('analysis').textContent='Visual Identity 분석 중…';const r=await fetch('/api/analyze_registration',{method:'POST',headers:{'Content-Type':'application/json','X-Admin-Key':$('admin').value},body:JSON.stringify(b)});const x=await r.json();if(!r.ok)return alert(JSON.stringify(x));const sm=x.summary;$('analysis').innerHTML=`<b>등록 힌트</b>: ${esc((sm.hint_tokens||[]).join(' / '))}<br><b>이미지 실제 OCR</b>: ${esc((sm.image_ocr_terms||[]).join(' | '))}<br><b>LIVE 후보어</b>: ${esc((sm.recognition_terms||[]).join(' | '))}<br><b>전체 색상</b>: ${esc(paletteText(sm.full_color))}<br><b>디자인 복잡도</b>: ${esc(sm.design?.visual_complexity_10)}/10 · <b>SIFT</b>: ${sm.sift_features}<br><b>TEXT LIKENESS</b>: 기준 ${esc(sm.text_likeness_gate?.min_score)}점 / 문자 ${esc(sm.text_likeness_gate?.passed)} / 비문자 제외 ${esc(sm.text_likeness_gate?.excluded)}<br><b>TEXT SIZE GATE</b>: ${esc(sm.text_size_gate?.hard_pct)}% 이상 기본 통과 / 통과 ${esc(sm.text_size_gate?.passed)} / 제외 ${esc(sm.text_size_gate?.excluded)}<br><br><b>TEXT IDENTITY</b>${identityHtml(sm.text_identity)}`;$('previews').innerHTML=(x.primary_preview?`<div>PRIMARY 시각밴드<br><img src="${x.primary_preview}"></div>`:'')+(x.secondary_preview?`<div>SECONDARY 시각밴드<br><img src="${x.secondary_preview}"></div>`:'')};
-$('f').onsubmit=async e=>{e.preventDefault();if(!$('admin').value)return alert('관리자 키를 저장하세요.');const b=await payload();const r=await fetch('/api/entries',{method:'POST',headers:{'Content-Type':'application/json','X-Admin-Key':$('admin').value},body:JSON.stringify(b)});const x=await r.json();if(!r.ok)return alert(JSON.stringify(x));alert('등록 완료');refresh()};
-async function refresh(){const h=await(await fetch('/health')).json();$('state').innerHTML=`<span class="ok">ONLINE</span> V${h.version} · ${h.entries}개`;const r=await fetch('/api/entries',{headers:ah()});if(!r.ok)return;const a=await r.json();let t='<table><tr><th>등록명</th><th>표시명</th><th>힌트</th><th>링크</th><th>이미지 OCR</th><th>색/Visual</th><th>URL</th><th>관리</th></tr>';for(const x of a){const o=x.profile_summary?.image_ocr_terms||[];t+=`<tr><td><b>${esc(x.registration_name)}</b></td><td>${esc(x.display_name)}</td><td>${esc(x.hint_text||'')}</td><td>${(x.links||[]).map(v=>esc(v.title)).join(' / ')}</td><td>${x.profile_summary?.ocr_ready?esc(o.slice(0,7).join(' / ')):'<span class="warn">OCR 미분석 · 재등록 권장</span>'}</td><td>${esc(paletteText(x.profile_summary?.color))}<br>SIFT ${esc(x.profile_summary?.sift_features||0)}</td><td><a href="${esc(x.url)}" target="_blank">열기</a></td><td><button onclick="showProfile(${x.id})">분석보기</button> <button class="danger" onclick="delx(${x.id})">삭제</button></td></tr>`}$('list').innerHTML=t+'</table>'}
-async function showProfile(id){const r=await fetch('/api/entries/'+id+'/profile',{headers:ah()});if(!r.ok)return alert('분석정보 조회 실패');const x=await r.json(),p=x.profile||{};$('modalTitle').textContent=`${x.registration_name} · 분석정보`;const ir=await fetch('/api/entries/'+id+'/reference-image',{headers:ah()});if(ir.ok){const u=URL.createObjectURL(await ir.blob());$('modalImage').innerHTML=`<div>등록 기준이미지<br><img src="${u}"></div>`}else $('modalImage').innerHTML='';$('modalBody').innerHTML=`<p><b>힌트:</b> ${esc(x.hint_text||'')}</p><p><b>링크:</b> ${(x.links||[]).map(v=>esc(v.title)+' → '+esc(v.url)).join('<br>')}</p><p><b>등록 힌트:</b> ${esc((p.context?.hint_tokens||[]).join(' / '))}</p><p><b>이미지 OCR:</b> ${esc((p.context?.image_ocr_terms||[]).join(' | '))}</p><p><b>전체 후보어:</b> ${esc((p.context?.recognition_terms||[]).join(' | '))}</p><p><b>색상:</b> ${esc(paletteText(p.full_visual?.color))} · <b>디자인:</b> ${esc(p.design?.visual_complexity_10)}/10</p>${identityHtml(p.text_identity||[])}<h4>Raw Identity Profile</h4><div class="profile">${esc(JSON.stringify(p,null,2))}</div>`;$('modal').style.display='block'}
-function closeModal(){$('modal').style.display='none';$('modalImage').innerHTML=''}
-async function delx(id){if(!confirm('이 등록을 삭제할까요?'))return;const r=await fetch('/api/entries/'+id,{method:'DELETE',headers:ah()});if(!r.ok)return alert('삭제 실패');refresh()}
+let cache={key:'',items:[]},worker=null,analyzed=false;function fk(f){return f?`${f.name}:${f.size}:${f.lastModified}`:''}
+async function ocr(){const f=$('fullImg').files[0];if(!f)return[];if(cache.key===fk(f))return cache.items;if(!worker)worker=await Tesseract.createWorker(['kor','eng'],1,{logger:m=>{if(m.status)$('ocrState').textContent=`OCR ${m.status} ${Math.round((m.progress||0)*100)}%`}});const r=await worker.recognize(f);const ls=(r.data.lines&&r.data.lines.length?r.data.lines:r.data.words)||[];const items=ls.filter(x=>x.text&&String(x.text).trim().length>1&&x.bbox).map(x=>({text:String(x.text).trim(),confidence:Number(x.confidence||0),bbox:{x0:x.bbox.x0,y0:x.bbox.y0,x1:x.bbox.x1,y1:x.bbox.y1}}));cache={key:fk(f),items};$('ocrState').textContent=`OCR 완료 · ${items.length}개`;return items}
+$('analyze').onclick=async()=>{if(!$('admin').value)return alert('관리자 키를 저장하세요.');const f=$('fullImg').files[0];if(!f)return alert('이미지를 먼저 선택하세요.');const b={reference_image_base64:await file64(f),detected_texts:await ocr()};const r=await fetch('/api/analyze_registration',{method:'POST',headers:{'Content-Type':'application/json','X-Admin-Key':$('admin').value},body:JSON.stringify(b)});const x=await r.json();if(!r.ok)return alert(JSON.stringify(x));$('regname').value=x.draft?.registration_name||'';$('display').value=x.draft?.display_name||'';$('hint').value=x.draft?.hint_text||'';$('analysis').innerHTML=`<b>자동 초안 생성 완료</b><br>OCR: ${esc((x.draft?.ocr_ranked||[]).join(' | '))}<br>분석버전: ${esc(x.analysis_version)}<br>SHA-256: ${esc(x.source_sha256)}`;$('previews').innerHTML=(x.primary_preview?`<div>Reference ROI 1<br><img src="${x.primary_preview}"></div>`:'')+(x.secondary_preview?`<div>Reference ROI 2<br><img src="${x.secondary_preview}"></div>`:'');analyzed=true};
+function resetForm(){analyzed=false;cache={key:'',items:[]};$('fullImg').value='';['regname','display','hint','linktitle1','linkurl1','linktitle2','linkurl2','linktitle3','linkurl3'].forEach(id=>$(id).value='');$('analysis').textContent='아직 분석하지 않았습니다.';$('previews').innerHTML='';$('ocrState').textContent='이미지를 선택하세요.'}
+$('resetBtn').onclick=resetForm;$('fullImg').addEventListener('change',()=>{analyzed=false;cache={key:'',items:[]};$('analysis').textContent='새 이미지 선택됨 · 먼저 분석하세요.'});
+$('f').onsubmit=async e=>{e.preventDefault();if(!analyzed)return alert('먼저 이미지를 분석하세요.');const links=[{title:$('linktitle1').value.trim(),url:$('linkurl1').value.trim()},{title:$('linktitle2').value.trim(),url:$('linkurl2').value.trim()},{title:$('linktitle3').value.trim(),url:$('linkurl3').value.trim()}].filter(x=>x.url);if(!links.length)return alert('링크 주소를 1개 이상 입력하세요.');const f=$('fullImg').files[0],b={registration_name:$('regname').value.trim(),display_name:$('display').value.trim(),hint_text:$('hint').value.trim(),url:links[0].url,links,original_filename:f?.name||'',reference_image_base64:await file64(f),detected_texts:await ocr()};const r=await fetch('/api/entries',{method:'POST',headers:{'Content-Type':'application/json','X-Admin-Key':$('admin').value},body:JSON.stringify(b)});const x=await r.json();if(!r.ok)return alert(JSON.stringify(x));alert(`등록 완료 · ID ${x.id}`);resetForm();refresh()};
+async function refresh(){const h=await(await fetch('/health')).json();$('persist').innerHTML=h.durable?`<span class="ok">영구 DB: ${esc(h.database)}</span>`:`<span class="warn">${esc(h.persistence_warning)}</span>`;$('state').innerHTML=`<span class="ok">ONLINE</span> V${h.version} · ${h.entries}개 · Schema ${h.registry_schema_version} · Analysis ${esc(h.analysis_version)}`;const r=await fetch('/api/entries',{headers:ah()});if(!r.ok)return;const a=await r.json();let t='<table><tr><th>ID</th><th>등록명/표시명</th><th>힌트</th><th>링크</th><th>분석버전</th><th>원본</th><th>관리</th></tr>';for(const x of a)t+=`<tr><td>${x.id}</td><td><b>${esc(x.registration_name)}</b><br>${esc(x.display_name)}</td><td>${esc(x.hint_text||'')}</td><td>${(x.links||[]).map(v=>esc(v.title)).join(' / ')}</td><td>${esc(x.analysis_version||'legacy')}</td><td>${esc(x.original_filename||'')}<br><small>${esc((x.source_sha256||'').slice(0,12))}</small></td><td><button onclick="reanalyze(${x.id})">재분석</button> <button class="danger" onclick="delx(${x.id})">비활성화</button></td></tr>`;$('list').innerHTML=t+'</table>'}
+async function reanalyze(id){const r=await fetch('/api/entries/'+id+'/reanalyze',{method:'POST',headers:ah()});if(!r.ok)return alert('재분석 실패');refresh()}
+$('reanalyzeOld').onclick=async()=>{if(!confirm('사람이 확정한 정보와 원본은 유지하고 구버전 분석만 다시 생성합니다.'))return;const r=await fetch('/api/reanalyze_outdated',{method:'POST',headers:ah()});const x=await r.json();alert(`재분석 ${x.reanalyzed||0}건`);refresh()}
+async function delx(id){if(!confirm('물리 삭제하지 않고 비활성화합니다.'))return;const r=await fetch('/api/entries/'+id,{method:'DELETE',headers:ah()});if(!r.ok)return alert('실패');refresh()}
 async function loadTraces(){const r=await fetch('/api/traces?limit=50',{headers:ah()});if(!r.ok)return;$('traces').textContent=(await r.json()).map(x=>`${x.created_at||''} | ${x.session_id} | ${x.event}\n${JSON.stringify(x.payload)}`).join('\n\n')}
-$('fullImg').addEventListener('change',()=>{ocrCache={fileKey:'',items:[]};$('ocrState').textContent='새 이미지 선택됨 · 사전분석 시 한글+영문 OCR 실행'});refresh();
-</script></body></html>"""
+refresh();</script></body></html>"""
 
 
 @app.get("/")
@@ -1647,14 +1693,18 @@ def index():
 
 @app.get("/health")
 def health():
-    return jsonify(ok=True, version=VERSION, database=db.engine.url.get_backend_name(), entries=Link.query.count(), traces=LiveTrace.query.count())
+    ps=persistence_status()
+    return jsonify(ok=True,version=VERSION,database=ps["backend"],durable=ps["durable"],
+        persistence_warning=ps["warning"],entries=Link.query.filter_by(enabled=True).count(),
+        traces=LiveTrace.query.count(),registry_schema_version=REGISTRY_SCHEMA_VERSION,
+        analysis_version=REGISTRY_ANALYSIS_VERSION)
 
 
 @app.get("/api/entries")
 def entries():
     if not require_admin():
         return jsonify(error="unauthorized"), 401
-    rows = Link.query.filter_by(enabled=True).order_by(Link.priority.desc(), Link.id.desc()).all()
+    rows = Link.query.filter_by(enabled=True, deleted_at=None).order_by(Link.priority.desc(), Link.id.desc()).all()
     return jsonify([r.public_dict() for r in rows])
 
 
@@ -1662,13 +1712,21 @@ def entries():
 def analyze_registration():
     if not require_admin():return jsonify(error="unauthorized"),401
     x=request.get_json(silent=True) or {}
-    rn=str(x.get("registration_name","")).strip();dn=str(x.get("display_name","")).strip()
     raw=b64_bytes(x.get("reference_image_base64"))
-    if not rn or not dn or not raw or decode_gray(raw) is None:
-        return jsonify(error="등록명/표시명/기준이미지가 필요합니다."),400
-    p,pr,sr=analyze_registration_image(raw,rn,dn,x.get("detected_texts") or [],x.get("hint_text",""))
+    if not raw or decode_gray(raw) is None:return jsonify(error="먼저 기준 이미지를 선택하세요."),400
+    detected=x.get("detected_texts") or []
+    draft=registration_draft_from_ocr(detected)
+    rn=str(x.get("registration_name","")).strip() or draft["registration_name"] or "미확정"
+    dn=str(x.get("display_name","")).strip() or draft["display_name"] or rn
+    hint=str(x.get("hint_text","")).strip() or draft["hint_text"]
+    p,pr,sr=analyze_registration_image(raw,rn,dn,detected,hint)
+    p["registry"]={"schema_version":REGISTRY_SCHEMA_VERSION,"analysis_version":REGISTRY_ANALYSIS_VERSION,
+                   "source_sha256":source_hash(raw),"source_is_original":True}
     enc=lambda z:("data:image/jpeg;base64,"+base64.b64encode(z).decode("ascii")) if z else None
-    return jsonify(ok=True,version=VERSION,summary=registration_analysis_summary(p),primary_preview=enc(pr),secondary_preview=enc(sr))
+    return jsonify(ok=True,version=VERSION,draft=draft,summary=registration_analysis_summary(p),
+        source_sha256=source_hash(raw),analysis_version=REGISTRY_ANALYSIS_VERSION,
+        primary_preview=enc(pr),secondary_preview=enc(sr))
+
 
 @app.post("/api/entries")
 def create_entry():
@@ -1692,6 +1750,8 @@ def create_entry():
     if decode_gray(raw) is None:return jsonify(error="기준이미지를 읽을 수 없습니다."),400
     p,pr,sr=analyze_registration_image(raw,rn,dn,x.get("detected_texts") or [],x.get("hint_text",""))
     hints=p.get("context",{}).get("recognition_terms",[])
+    p["registry"]={"schema_version":REGISTRY_SCHEMA_VERSION,"analysis_version":REGISTRY_ANALYSIS_VERSION,
+                   "source_sha256":source_hash(raw),"source_is_original":True}
     item=Link(key_text=rn,registration_name=rn,major_category="",minor_category="",recognition_text=" | ".join(hints),
       display_name=dn,
         group_name="",action_name="",
@@ -1706,7 +1766,10 @@ def create_entry():
       visual_threshold=48.0,priority=int(x.get("priority") or 0),use_location=bool(x.get("use_location")),
       latitude=float(x["latitude"]) if x.get("latitude") is not None else None,
       longitude=float(x["longitude"]) if x.get("longitude") is not None else None,
-      radius_m=float(x.get("radius_m") or 150),identity_profile=json.dumps(p,ensure_ascii=False))
+      radius_m=float(x.get("radius_m") or 150),identity_profile=json.dumps(p,ensure_ascii=False),
+      schema_version=REGISTRY_SCHEMA_VERSION,analysis_version=REGISTRY_ANALYSIS_VERSION,
+      original_filename=str(x.get("original_filename",""))[:500],
+      source_sha256=source_hash(raw),deleted_at=None)
     db.session.add(item);db.session.commit();return jsonify(item.public_dict()),201
 
 
@@ -1717,11 +1780,62 @@ def delete_entry(item_id):
     item = db.session.get(Link, item_id)
     if not item:
         return jsonify(error="not found"), 404
-    db.session.delete(item)
+    item.enabled=False
+    item.deleted_at=datetime.now(timezone.utc)
+    item.updated_at=datetime.now(timezone.utc)
+    db.session.add(item);db.session.commit()
+    return jsonify(ok=True,soft_deleted=True,id=item.id)
+
+
+
+
+@app.patch("/api/entries/<int:item_id>")
+def update_entry(item_id):
+    if not require_admin():return jsonify(error="unauthorized"),401
+    item=db.session.get(Link,item_id)
+    if not item or item.deleted_at is not None:return jsonify(error="not found"),404
+    x=request.get_json(silent=True) or {}
+    mapping={"registration_name":"registration_name","display_name":"display_name","hint_text":"hint_text",
+             "link_title_1":"link_title_1","link_url_1":"link_url_1",
+             "link_title_2":"link_title_2","link_url_2":"link_url_2",
+             "link_title_3":"link_title_3","link_url_3":"link_url_3"}
+    for key,attr in mapping.items():
+        if key in x:setattr(item,attr,str(x.get(key) or "").strip())
+    item.url=item.link_url_1 or item.url
+    item.updated_at=datetime.now(timezone.utc)
+    db.session.add(item);db.session.commit()
+    return jsonify(item.public_dict())
+
+@app.post("/api/entries/<int:item_id>/reanalyze")
+def reanalyze_entry(item_id):
+    if not require_admin():return jsonify(error="unauthorized"),401
+    item=db.session.get(Link,item_id)
+    if not item or item.deleted_at is not None:return jsonify(error="not found"),404
+    f=item.fields()
+    p,pr,sr=analyze_registration_image(item.reference_image,f["registration_name"],f["display_name"],[],item.hint_text)
+    p["registry"]={"schema_version":REGISTRY_SCHEMA_VERSION,"analysis_version":REGISTRY_ANALYSIS_VERSION,
+                   "source_sha256":item.source_sha256 or source_hash(item.reference_image),"source_is_original":True}
+    item.identity_profile=json.dumps(p,ensure_ascii=False);item.major_reference=pr;item.minor_reference=sr
+    item.analysis_version=REGISTRY_ANALYSIS_VERSION;item.updated_at=datetime.now(timezone.utc)
+    db.session.add(item);db.session.commit();return jsonify(item.public_dict())
+
+@app.post("/api/reanalyze_outdated")
+def reanalyze_outdated():
+    if not require_admin():return jsonify(error="unauthorized"),401
+    rows=Link.query.filter(Link.deleted_at.is_(None),Link.enabled.is_(True),Link.analysis_version!=REGISTRY_ANALYSIS_VERSION).all()
+    done=0
+    for item in rows:
+        try:
+            f=item.fields()
+            p,pr,sr=analyze_registration_image(item.reference_image,f["registration_name"],f["display_name"],[],item.hint_text)
+            p["registry"]={"schema_version":REGISTRY_SCHEMA_VERSION,"analysis_version":REGISTRY_ANALYSIS_VERSION,
+                           "source_sha256":item.source_sha256 or source_hash(item.reference_image),"source_is_original":True}
+            item.identity_profile=json.dumps(p,ensure_ascii=False);item.major_reference=pr;item.minor_reference=sr
+            item.analysis_version=REGISTRY_ANALYSIS_VERSION;item.updated_at=datetime.now(timezone.utc)
+            db.session.add(item);done+=1
+        except Exception:pass
     db.session.commit()
-    return jsonify(ok=True)
-
-
+    return jsonify(ok=True,reanalyzed=done,analysis_version=REGISTRY_ANALYSIS_VERSION)
 
 @app.get("/api/entries/<int:item_id>/profile")
 def entry_profile(item_id):
@@ -1951,17 +2065,33 @@ def resolve_frame():
     live_sift=prepare_live_sift(raw)
 
     rows=Link.query.filter_by(enabled=True).all()
-    candidates=[]
+    ranked=[]
     for row in rows:
         te=row_text_evidence(row,live_texts)
         emb=visual_embedding_similarity(_profile_visual_embedding(row),live_emb)
-        # Candidate entry is deliberately broad. Final pass is SIFT evidence-combination.
-        if te["score"]>=38.0 or emb>=28.0:
-            candidates.append((row,te,float(emb)))
+        ranked.append((row,te,float(emb)))
 
-    # Text evidence first, visual retrieval second.
+    # V0.8.2.1 candidate policy:
+    # Global embedding is weak when the registered object occupies only part of
+    # the camera frame. It may rank candidates, but must not erase a real target.
+    #
+    # Prototype/small registry: SIFT all enabled registrations. This guarantees
+    # that a good target frame is actually judged.
+    # Larger registry: keep all text candidates plus the strongest visual ranks.
+    if len(ranked)<=60:
+        candidates=list(ranked)
+        candidate_mode="FULL_REGISTRY_SIFT"
+    else:
+        text_hits=[q for q in ranked if q[1]["score"]>=38.0]
+        visual_hits=sorted(ranked,key=lambda q:q[2],reverse=True)[:12]
+        by_id={}
+        for q in text_hits+visual_hits:
+            by_id[q[0].id]=q
+        candidates=list(by_id.values())
+        candidate_mode="TEXT_PLUS_VISUAL_TOP12"
+
     candidates.sort(key=lambda q:(q[1]["score"],q[2]),reverse=True)
-    candidates=candidates[:8]
+    candidates=candidates[:60 if candidate_mode=="FULL_REGISTRY_SIFT" else 20]
 
     matches=[]; diagnostics=[]
     for row,te,emb in candidates:
@@ -2011,6 +2141,9 @@ def resolve_frame():
             "sift_inlier_ratio":sd.get("inlier_ratio",0),
             "sift_coverage":sd.get("coverage",0),
             "sift_median_error":sd.get("median_error"),
+            "target_roi":sd.get("target_roi"),
+            "target_area_pct":sd.get("target_area_pct",0.0),
+            "roi_found":bool(sd.get("target_roi")),
             "decision_reason":reason,
             "gps_ok":gok,
             "distance_m":dist,
@@ -2027,6 +2160,8 @@ def resolve_frame():
         matches=matches,
         diagnostics=diagnostics,
         candidate_count=len(candidates),
+        candidate_mode=candidate_mode,
+        frame_mode="FULL_SELECTED_FRAME",
         elapsed_ms=elapsed,
         version=VERSION
     )
@@ -2579,6 +2714,12 @@ def migrate():
         ("link_url_2", "TEXT"),
         ("link_title_3", "VARCHAR(200)"),
         ("link_url_3", "TEXT"),
+        ("schema_version", "INTEGER DEFAULT 1"),
+        ("analysis_version", "VARCHAR(80) DEFAULT 'legacy'"),
+        ("original_filename", "VARCHAR(500) DEFAULT ''"),
+        ("source_sha256", "VARCHAR(64) DEFAULT ''"),
+        ("updated_at", "TIMESTAMP"),
+        ("deleted_at", "TIMESTAMP"),
     ]
     with db.engine.begin() as conn:
         for name, typ in additions:
@@ -2595,7 +2736,16 @@ def migrate():
           action_name=COALESCE(action_name,'')
         """))
 
-    # legacy rows receive the new profile.
+    # Preserve existing IDs and human metadata; only backfill new metadata.
+    for row in Link.query.all():
+        if not row.schema_version: row.schema_version=REGISTRY_SCHEMA_VERSION
+        if not row.analysis_version: row.analysis_version="legacy"
+        if not row.source_sha256 and row.reference_image: row.source_sha256=source_hash(row.reference_image)
+        if not row.updated_at: row.updated_at=row.created_at or datetime.now(timezone.utc)
+        db.session.add(row)
+    db.session.commit()
+
+    # Legacy rows only rebuild missing compatible analysis.
     for row in Link.query.all():
         f = row.fields()
         desired = build_recognition_text(f["major_category"], f["minor_category"])
@@ -2607,11 +2757,7 @@ def migrate():
             current = json.loads(row.identity_profile or "{}")
         except Exception:
             current = {}
-        needs_rebuild = (
-            not current or current.get("profile_version") not in ("3.0","4.0") or
-            not current.get("full_visual", {}).get("sift", {}).get("npz_b64") or
-            not current.get("full_visual", {}).get("multiview_sift")
-        )
+        needs_rebuild = (not current or not current.get("full_visual", {}).get("sift", {}).get("npz_b64"))
         if needs_rebuild:
             try:
                 p,pr,sr=analyze_registration_image(row.reference_image,f["registration_name"],f["display_name"])
