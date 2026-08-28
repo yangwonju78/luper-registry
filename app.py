@@ -29,7 +29,7 @@ app.config["MAX_CONTENT_LENGTH"] = 15 * 1024 * 1024
 
 db = SQLAlchemy(app)
 ADMIN_KEY = os.getenv("ADMIN_KEY", "change-me")
-VERSION = "0.8.2.2"
+VERSION = "0.8.2.3"
 
 
 class Link(db.Model):
@@ -1617,37 +1617,101 @@ def candidate_score(ocr_texts,row):
 
 
 REGISTRY_SCHEMA_VERSION=1
-REGISTRY_ANALYSIS_VERSION="0822-registry-v1-sift-roi"
+REGISTRY_ANALYSIS_VERSION="0823-registry-v1-sift-roi"
 
 def source_hash(raw):
     return hashlib.sha256(raw or b"").hexdigest()
 
 def registration_draft_from_ocr(items):
-    rows=[]
+    """
+    Registration OCR is a suggestion only.
+    Bad OCR must NEVER become durable human metadata automatically.
+    """
+    ranked=[]
     for it in normalize_detected_texts(items):
         t=re.sub(r"\s+"," ",str(it.get("text",""))).strip(" |·_-")
-        if len(norm(t))<2: continue
+        n=norm(t)
+        if len(n)<2: continue
+
         b=it.get("bbox") or {}
         area=max(1,(b.get("x1",0)-b.get("x0",0))*(b.get("y1",0)-b.get("y0",0)))
         conf=float(it.get("confidence",0) or 0)
-        ui_noise=bool(re.search(r"\.(jpg|jpeg|png|webp)|\b\d+(kb|mb|gb)\b|^f\d+$",t,re.I))
-        score=min(len(norm(t)),24)*2.0+conf*.35+math.log10(area+10)*7.0-(45 if ui_noise else 0)
-        rows.append((score,t))
-    rows.sort(reverse=True)
-    texts=[]; seen=set()
-    for _,t in rows:
-        k=_norm_match_text(t)
+
+        ui_noise=bool(re.search(
+            r"\.(jpg|jpeg|png|webp|gif|pdf)|\b\d+(kb|mb|gb)\b|^f\d+$|^\d{6,}$",
+            t,re.I))
+        chars=re.sub(r"\s+","",t)
+        hangul=len(re.findall(r"[가-힣]",chars))
+        latin=len(re.findall(r"[A-Za-z]",chars))
+        digits=len(re.findall(r"\d",chars))
+        useful=hangul+latin
+        alnum=useful+digits
+        weird=max(0,len(chars)-alnum)
+
+        # A title/name should primarily be letters; digits/punctuation are tolerated,
+        # but a low-confidence mixed OCR like "AarZ 54," must not be auto-committed.
+        letter_ratio=useful/max(1,len(chars))
+        digit_ratio=digits/max(1,len(chars))
+        weird_ratio=weird/max(1,len(chars))
+
+        reliable=(
+            conf>=67.0 and
+            not ui_noise and
+            useful>=2 and
+            letter_ratio>=0.58 and
+            digit_ratio<=0.35 and
+            weird_ratio<=0.22
+        )
+
+        score=(
+            min(len(n),24)*2.0 +
+            conf*.55 +
+            math.log10(area+10)*6.0 -
+            (55 if ui_noise else 0) -
+            digit_ratio*28.0 -
+            weird_ratio*35.0
+        )
+        ranked.append({
+            "score":round(score,1),
+            "text":t,
+            "confidence":round(conf,1),
+            "reliable":bool(reliable),
+            "letter_ratio":round(letter_ratio,3),
+        })
+
+    ranked.sort(key=lambda x:x["score"],reverse=True)
+
+    # Deduplicate while keeping diagnostics.
+    uniq=[]; seen=set()
+    for r in ranked:
+        k=_norm_match_text(r["text"])
         if not k or k in seen: continue
-        seen.add(k); texts.append(t)
-    primary=texts[0] if texts else ""
+        seen.add(k); uniq.append(r)
+
+    reliable=[r for r in uniq if r["reliable"]]
+    primary=reliable[0]["text"] if reliable else ""
+
+    # Auto-fill only from reliable OCR. Uncertain OCR remains visible for review,
+    # but does not pollute registration_name/display_name/hint_text.
     hint=[]
-    for t in texts[:8]:
-        hint.append(t)
+    for r in reliable[:8]:
+        t=r["text"]; hint.append(t)
         n=_norm_match_text(t)
         if n and n!=t.lower(): hint.append(n)
     hint=list(dict.fromkeys(x for x in hint if x))[:12]
-    return {"registration_name":primary,"display_name":primary[:120],
-            "hint_text":" / ".join(hint),"ocr_ranked":texts[:12]}
+
+    best_conf=float(reliable[0]["confidence"]) if reliable else 0.0
+    return {
+        "registration_name":primary,
+        "display_name":primary[:120] if primary else "",
+        "hint_text":" / ".join(hint),
+        "ocr_ranked":[r["text"] for r in uniq[:12]],
+        "ocr_diagnostics":uniq[:12],
+        "draft_confidence":round(best_conf,1),
+        "requires_human_name":not bool(primary),
+        "draft_status":"AUTO_SUGGESTED" if primary else "OCR_UNCERTAIN_MANUAL_NAME_REQUIRED",
+    }
+
 
 def persistence_status():
     backend=db.engine.url.get_backend_name()
@@ -1659,9 +1723,9 @@ def persistence_status():
 # -------------------------- routes --------------------------
 
 INDEX_HTML = r"""<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>LUPER Registry V0.8.2.2</title><script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+<title>LUPER Registry V0.8.2.3</title><script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
 <style>body{font-family:system-ui;background:#f5f6f8;margin:0;color:#17191c}.w{max-width:1180px;margin:22px auto;padding:0 15px}.c{background:white;border:1px solid #ddd;border-radius:14px;padding:18px;margin:13px 0}.g{display:grid;grid-template-columns:1fr 1fr;gap:12px}.full{grid-column:1/-1}label{display:block;font-size:13px;color:#555;margin-bottom:5px}input{width:100%;box-sizing:border-box;padding:10px;border:1px solid #ccd1d7;border-radius:8px}button{border:0;border-radius:8px;background:#111;color:#fff;font-weight:700;padding:10px 14px;cursor:pointer}.ghost{background:#666}.danger{background:#a51d27}.muted{font-size:13px;color:#666}.ok{color:#18723a;font-weight:700}.warn{color:#a22;font-weight:700}.step{font-weight:800;margin-bottom:10px}table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:8px;border-bottom:1px solid #eee;text-align:left;vertical-align:top}.profile{white-space:pre-wrap;font:12px/1.55 monospace;background:#101114;color:#eee;padding:11px;border-radius:8px;max-height:420px;overflow:auto}.preview img{max-width:360px;max-height:230px;border:1px solid #ddd;border-radius:8px}@media(max-width:820px){.g{grid-template-columns:1fr}.full{grid-column:auto}}</style></head>
-<body><div class="w"><h2>LUPER Registry V0.8.2.2 · Registry V1</h2><p class="muted">원본/사람 확정 데이터는 유지하고 OCR·SIFT·ROI 등 분석 데이터만 버전별로 재생성합니다.</p>
+<body><div class="w"><h2>LUPER Registry V0.8.2.3 · Registry V1</h2><p class="muted">원본/사람 확정 데이터는 유지하고 OCR·SIFT·ROI 등 분석 데이터만 버전별로 재생성합니다.</p>
 <div class="c"><label>관리자 키</label><div style="display:flex;gap:8px"><input id="admin" type="password"><button id="saveKey">키 저장</button></div><div id="persist" class="muted"></div></div>
 <div class="c"><div class="step">1. 이미지 먼저 선택하고 분석</div><input id="fullImg" type="file" accept="image/*"><div id="ocrState" class="muted" style="margin:8px 0">이미지를 선택하세요.</div><button id="analyze">이미지 분석</button><div id="analysis" class="muted" style="margin-top:12px">아직 분석하지 않았습니다.</div><div id="previews" class="preview"></div></div>
 <div class="c"><div class="step">2. 자동 초안 확인 · 수정 가능</div><div class="g"><div><label>등록명 · 분석/관리 기준</label><input id="regname"></div><div><label>표시명 · 링크카드 표시</label><input id="display"></div><div class="full"><label>힌트 · 후보 검색 보조</label><input id="hint"></div></div></div>
@@ -1674,7 +1738,11 @@ $('admin').value=sessionStorage.getItem('luper_admin')||'';const ah=()=>({'X-Adm
 function file64(f){return new Promise((ok,no)=>{if(!f)return ok(null);let r=new FileReader();r.onload=()=>ok(r.result);r.onerror=no;r.readAsDataURL(f)})}
 let cache={key:'',items:[]},worker=null,analyzed=false;function fk(f){return f?`${f.name}:${f.size}:${f.lastModified}`:''}
 async function ocr(){const f=$('fullImg').files[0];if(!f)return[];if(cache.key===fk(f))return cache.items;if(!worker)worker=await Tesseract.createWorker(['kor','eng'],1,{logger:m=>{if(m.status)$('ocrState').textContent=`OCR ${m.status} ${Math.round((m.progress||0)*100)}%`}});const r=await worker.recognize(f);const ls=(r.data.lines&&r.data.lines.length?r.data.lines:r.data.words)||[];const items=ls.filter(x=>x.text&&String(x.text).trim().length>1&&x.bbox).map(x=>({text:String(x.text).trim(),confidence:Number(x.confidence||0),bbox:{x0:x.bbox.x0,y0:x.bbox.y0,x1:x.bbox.x1,y1:x.bbox.y1}}));cache={key:fk(f),items};$('ocrState').textContent=`OCR 완료 · ${items.length}개`;return items}
-$('analyze').onclick=async()=>{if(!$('admin').value)return alert('관리자 키를 저장하세요.');const f=$('fullImg').files[0];if(!f)return alert('이미지를 먼저 선택하세요.');const b={reference_image_base64:await file64(f),detected_texts:await ocr()};const r=await fetch('/api/analyze_registration',{method:'POST',headers:{'Content-Type':'application/json','X-Admin-Key':$('admin').value},body:JSON.stringify(b)});const x=await r.json();if(!r.ok)return alert(JSON.stringify(x));$('regname').value=x.draft?.registration_name||'';$('display').value=x.draft?.display_name||'';$('hint').value=x.draft?.hint_text||'';$('analysis').innerHTML=`<b>자동 초안 생성 완료</b><br>OCR: ${esc((x.draft?.ocr_ranked||[]).join(' | '))}<br>분석버전: ${esc(x.analysis_version)}<br>SHA-256: ${esc(x.source_sha256)}`;$('previews').innerHTML=(x.primary_preview?`<div>Reference ROI 1<br><img src="${x.primary_preview}"></div>`:'')+(x.secondary_preview?`<div>Reference ROI 2<br><img src="${x.secondary_preview}"></div>`:'');analyzed=true};
+$('analyze').onclick=async()=>{if(!$('admin').value)return alert('관리자 키를 저장하세요.');const f=$('fullImg').files[0];if(!f)return alert('이미지를 먼저 선택하세요.');const b={reference_image_base64:await file64(f),detected_texts:await ocr()};const r=await fetch('/api/analyze_registration',{method:'POST',headers:{'Content-Type':'application/json','X-Admin-Key':$('admin').value},body:JSON.stringify(b)});const x=await r.json();if(!r.ok)return alert(JSON.stringify(x));$('regname').value=x.draft?.registration_name||'';$('display').value=x.draft?.display_name||'';$('hint').value=x.draft?.hint_text||'';
+const uncertain=!!x.draft?.requires_human_name;
+$('analysis').innerHTML=uncertain
+ ? `<b class="warn">OCR 불확실 · 등록명을 직접 확인해 주세요.</b><br>검출 원문: ${esc((x.draft?.ocr_ranked||[]).join(' | '))}<br><b>AUTO 입력하지 않음</b><br>분석버전: ${esc(x.analysis_version)}<br>SHA-256: ${esc(x.source_sha256)}`
+ : `<b class="ok">자동 초안 생성 완료 · OCR 신뢰도 ${esc(x.draft?.draft_confidence||0)}%</b><br>OCR: ${esc((x.draft?.ocr_ranked||[]).join(' | '))}<br>분석버전: ${esc(x.analysis_version)}<br>SHA-256: ${esc(x.source_sha256)}`;$('previews').innerHTML=(x.primary_preview?`<div>Reference ROI 1<br><img src="${x.primary_preview}"></div>`:'')+(x.secondary_preview?`<div>Reference ROI 2<br><img src="${x.secondary_preview}"></div>`:'');analyzed=true};
 function resetForm(){analyzed=false;cache={key:'',items:[]};$('fullImg').value='';['regname','display','hint','linktitle1','linkurl1','linktitle2','linkurl2','linktitle3','linkurl3'].forEach(id=>$(id).value='');$('analysis').textContent='아직 분석하지 않았습니다.';$('previews').innerHTML='';$('ocrState').textContent='이미지를 선택하세요.'}
 $('resetBtn').onclick=resetForm;$('fullImg').addEventListener('change',()=>{analyzed=false;cache={key:'',items:[]};$('analysis').textContent='새 이미지 선택됨 · 먼저 분석하세요.'});
 $('f').onsubmit=async e=>{e.preventDefault();if(!analyzed)return alert('먼저 이미지를 분석하세요.');const links=[{title:$('linktitle1').value.trim(),url:$('linkurl1').value.trim()},{title:$('linktitle2').value.trim(),url:$('linkurl2').value.trim()},{title:$('linktitle3').value.trim(),url:$('linkurl3').value.trim()}].filter(x=>x.url);if(!links.length)return alert('링크 주소를 1개 이상 입력하세요.');const f=$('fullImg').files[0],b={registration_name:$('regname').value.trim(),display_name:$('display').value.trim(),hint_text:$('hint').value.trim(),url:links[0].url,links,original_filename:f?.name||'',reference_image_base64:await file64(f),detected_texts:await ocr()};const r=await fetch('/api/entries',{method:'POST',headers:{'Content-Type':'application/json','X-Admin-Key':$('admin').value},body:JSON.stringify(b)});const x=await r.json();if(!r.ok)return alert(JSON.stringify(x));alert(`등록 완료 · ID ${x.id}`);resetForm();refresh()};
@@ -1716,7 +1784,7 @@ def analyze_registration():
     if not raw or decode_gray(raw) is None:return jsonify(error="먼저 기준 이미지를 선택하세요."),400
     detected=x.get("detected_texts") or []
     draft=registration_draft_from_ocr(detected)
-    rn=str(x.get("registration_name","")).strip() or draft["registration_name"] or "미확정"
+    rn=str(x.get("registration_name","")).strip() or draft["registration_name"] or "분석중"
     dn=str(x.get("display_name","")).strip() or draft["display_name"] or rn
     hint=str(x.get("hint_text","")).strip() or draft["hint_text"]
     p,pr,sr=analyze_registration_image(raw,rn,dn,detected,hint)
