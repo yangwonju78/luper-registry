@@ -17,7 +17,19 @@ from sqlalchemy import inspect, text as sql_text
 
 app = Flask(__name__)
 
-db_url = os.getenv("DATABASE_URL", "sqlite:///registry.db")
+# Registry storage is version-independent.
+# Code can be replaced without replacing server/DB.
+SERVER_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_DIR = os.path.abspath(os.getenv("LUPER_DB_DIR", os.path.join(SERVER_DIR, "DB")))
+ORIGINAL_IMAGE_DIR = os.path.join(DB_DIR, "images", "original")
+DERIVED_IMAGE_DIR = os.path.join(DB_DIR, "images", "derived")
+os.makedirs(ORIGINAL_IMAGE_DIR, exist_ok=True)
+os.makedirs(DERIVED_IMAGE_DIR, exist_ok=True)
+
+# When DATABASE_URL is configured (e.g. managed PostgreSQL), metadata remains
+# durable there; registered source images still live in DB_DIR.
+_default_sqlite = "sqlite:///" + os.path.join(DB_DIR, "registry.db").replace("\\", "/")
+db_url = os.getenv("DATABASE_URL", _default_sqlite)
 if db_url.startswith("postgres://"):
     db_url = "postgresql+psycopg://" + db_url[len("postgres://"):]
 elif db_url.startswith("postgresql://") and "+psycopg" not in db_url:
@@ -29,8 +41,65 @@ app.config["MAX_CONTENT_LENGTH"] = 15 * 1024 * 1024
 
 db = SQLAlchemy(app)
 ADMIN_KEY = os.getenv("ADMIN_KEY", "change-me")
-VERSION = "0.8.2.4"
+VERSION = "0.8.2.5"
 
+
+
+def _safe_ext(filename, default=".jpg"):
+    ext=os.path.splitext(str(filename or ""))[1].lower()
+    if ext in {".jpg",".jpeg",".png",".webp",".bmp"}:
+        return ".jpg" if ext==".jpeg" else ext
+    return default
+
+def _write_atomic(path, raw):
+    if not raw:
+        return ""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp=path+".tmp"
+    with open(tmp,"wb") as f:
+        f.write(raw)
+    os.replace(tmp,path)
+    return path
+
+def _rel_db_path(abs_path):
+    try:
+        return os.path.relpath(abs_path, DB_DIR).replace("\\","/")
+    except Exception:
+        return abs_path
+
+def _abs_db_path(stored):
+    p=str(stored or "").strip()
+    if not p:
+        return ""
+    return p if os.path.isabs(p) else os.path.join(DB_DIR,p.replace("/",os.sep))
+
+def store_original_image(raw, sha256_value=None, original_filename=""):
+    if not raw:
+        return ""
+    sha=sha256_value or hashlib.sha256(raw).hexdigest()
+    ext=_safe_ext(original_filename, ".jpg")
+    path=os.path.join(ORIGINAL_IMAGE_DIR, f"{sha}{ext}")
+    if not os.path.exists(path):
+        _write_atomic(path,raw)
+    return _rel_db_path(path)
+
+def store_derived_image(raw, source_sha, kind):
+    if not raw:
+        return ""
+    safe_kind=re.sub(r"[^a-zA-Z0-9_-]+","_",str(kind or "derived"))
+    path=os.path.join(DERIVED_IMAGE_DIR, f"{source_sha}_{safe_kind}.jpg")
+    _write_atomic(path,raw)
+    return _rel_db_path(path)
+
+def load_stored_image(path_value, legacy_blob=None):
+    path=_abs_db_path(path_value)
+    if path and os.path.isfile(path):
+        try:
+            with open(path,"rb") as f:
+                return f.read()
+        except Exception:
+            pass
+    return bytes(legacy_blob or b"")
 
 class Link(db.Model):
     __tablename__ = "links"
@@ -61,9 +130,14 @@ class Link(db.Model):
     priority = db.Column(db.Integer, nullable=False, default=0)
     enabled = db.Column(db.Boolean, nullable=False, default=True)
 
+    # Legacy BLOB columns are retained only for automatic migration/backward
+    # compatibility. New registrations store image bytes in server/DB/images.
     reference_image = db.Column(db.LargeBinary, nullable=False)
     major_reference = db.Column(db.LargeBinary)
     minor_reference = db.Column(db.LargeBinary)
+    reference_image_path = db.Column(db.String(800), nullable=False, default="")
+    major_reference_path = db.Column(db.String(800), nullable=False, default="")
+    minor_reference_path = db.Column(db.String(800), nullable=False, default="")
 
     visual_threshold = db.Column(db.Float, nullable=False, default=48.0)
     identity_profile = db.Column(db.Text)
@@ -122,6 +196,10 @@ class Link(db.Model):
             "priority": self.priority,
             "enabled": bool(self.enabled),
             "visual_threshold": self.visual_threshold,
+            "storage": {
+                "reference_image_path": self.reference_image_path or "",
+                "file_backed": bool(self.reference_image_path),
+            },
             "profile_summary": {
                 "mode": profile.get("mode"),
                 "hint_tokens": profile.get("context", {}).get("hint_tokens", []),
@@ -702,7 +780,7 @@ def _profile_visual_embedding(row):
     if emb and emb.get("version")==VISUAL_EMBED_VERSION and emb.get("vec"):
         return emb
     # Lazy fallback for old registrations.
-    emb=visual_embedding(row.reference_image)
+    emb=visual_embedding(row_reference_bytes(row))
     try:
         p["visual_embedding"]=emb
         row.identity_profile=json.dumps(p,ensure_ascii=False)
@@ -1537,7 +1615,7 @@ def profile_visual_score(row, frame_raw):
 
     sift_fp = p.get("full_visual", {}).get("sift", {})
     if not sift_fp:
-        sift_fp = sift_fingerprint(row.reference_image)
+        sift_fp = sift_fingerprint(row_reference_bytes(row))
 
     sd = sift_homography_score_from_fp(sift_fp, frame_raw)
     sift_score = float(sd.get("score", 0.0))
@@ -1557,7 +1635,7 @@ def profile_visual_score(row, frame_raw):
             "method": "SIFT_FAST",
         }
 
-    sh, orb, legacy = visual_score(row.reference_image, frame_raw)
+    sh, orb, legacy = visual_score(row_reference_bytes(row), frame_raw)
     if sd.get("homography") and sd.get("inliers", 0) >= 8:
         final = max(sift_score, sift_score * 0.88 + legacy * 0.12)
         method = "SIFT_HOMOGRAPHY"
@@ -1575,6 +1653,25 @@ def profile_visual_score(row, frame_raw):
 
 
 # -------------------------- candidate / verification --------------------------
+
+
+def row_reference_bytes(row):
+    return load_stored_image(
+        getattr(row,"reference_image_path",""),
+        getattr(row,"reference_image",b"")
+    )
+
+def row_major_bytes(row):
+    return load_stored_image(
+        getattr(row,"major_reference_path",""),
+        getattr(row,"major_reference",b"")
+    )
+
+def row_minor_bytes(row):
+    return load_stored_image(
+        getattr(row,"minor_reference_path",""),
+        getattr(row,"minor_reference",b"")
+    )
 
 def require_admin():
     return bool(ADMIN_KEY) and request.headers.get("X-Admin-Key", "") == ADMIN_KEY
@@ -1617,7 +1714,7 @@ def candidate_score(ocr_texts,row):
 
 
 REGISTRY_SCHEMA_VERSION=1
-REGISTRY_ANALYSIS_VERSION="0824-registry-v1-sift-roi"
+REGISTRY_ANALYSIS_VERSION="0825-registry-v2-file-image-store"
 
 def source_hash(raw):
     return hashlib.sha256(raw or b"").hexdigest()
@@ -1765,7 +1862,8 @@ def health():
     return jsonify(ok=True,version=VERSION,database=ps["backend"],durable=ps["durable"],
         persistence_warning=ps["warning"],entries=Link.query.filter_by(enabled=True).count(),
         traces=LiveTrace.query.count(),registry_schema_version=REGISTRY_SCHEMA_VERSION,
-        analysis_version=REGISTRY_ANALYSIS_VERSION)
+        analysis_version=REGISTRY_ANALYSIS_VERSION,
+        storage_mode="FILE_IMAGE_STORE_V1",db_dir=DB_DIR)
 
 
 @app.get("/api/entries")
@@ -1820,6 +1918,11 @@ def create_entry():
     hints=p.get("context",{}).get("recognition_terms",[])
     p["registry"]={"schema_version":REGISTRY_SCHEMA_VERSION,"analysis_version":REGISTRY_ANALYSIS_VERSION,
                    "source_sha256":source_hash(raw),"source_is_original":True}
+    sha=source_hash(raw)
+    ref_path=store_original_image(raw,sha,str(x.get("original_filename","")))
+    major_path=store_derived_image(pr,sha,"major") if pr else ""
+    minor_path=store_derived_image(sr,sha,"minor") if sr else ""
+
     item=Link(key_text=rn,registration_name=rn,major_category="",minor_category="",recognition_text=" | ".join(hints),
       display_name=dn,
         group_name="",action_name="",
@@ -1830,14 +1933,16 @@ def create_entry():
         link_url_2=clean_links[1]["url"] if len(clean_links)>1 else "",
         link_title_3=clean_links[2]["title"] if len(clean_links)>2 else "",
         link_url_3=clean_links[2]["url"] if len(clean_links)>2 else "",
-        url=(clean_links[0]["url"] if clean_links else url),match_mode="CONTEXT_VISUAL",reference_image=raw,major_reference=pr,minor_reference=sr,
+        url=(clean_links[0]["url"] if clean_links else url),match_mode="CONTEXT_VISUAL",
+      reference_image=b"",major_reference=None,minor_reference=None,
+      reference_image_path=ref_path,major_reference_path=major_path,minor_reference_path=minor_path,
       visual_threshold=48.0,priority=int(x.get("priority") or 0),use_location=bool(x.get("use_location")),
       latitude=float(x["latitude"]) if x.get("latitude") is not None else None,
       longitude=float(x["longitude"]) if x.get("longitude") is not None else None,
       radius_m=float(x.get("radius_m") or 150),identity_profile=json.dumps(p,ensure_ascii=False),
       schema_version=REGISTRY_SCHEMA_VERSION,analysis_version=REGISTRY_ANALYSIS_VERSION,
       original_filename=str(x.get("original_filename",""))[:500],
-      source_sha256=source_hash(raw),deleted_at=None)
+      source_sha256=sha,deleted_at=None)
     db.session.add(item);db.session.commit();return jsonify(item.public_dict()),201
 
 
@@ -1880,10 +1985,14 @@ def reanalyze_entry(item_id):
     item=db.session.get(Link,item_id)
     if not item or item.deleted_at is not None:return jsonify(error="not found"),404
     f=item.fields()
-    p,pr,sr=analyze_registration_image(item.reference_image,f["registration_name"],f["display_name"],[],item.hint_text)
+    p,pr,sr=analyze_registration_image(row_reference_bytes(item),f["registration_name"],f["display_name"],[],item.hint_text)
     p["registry"]={"schema_version":REGISTRY_SCHEMA_VERSION,"analysis_version":REGISTRY_ANALYSIS_VERSION,
-                   "source_sha256":item.source_sha256 or source_hash(item.reference_image),"source_is_original":True}
-    item.identity_profile=json.dumps(p,ensure_ascii=False);item.major_reference=pr;item.minor_reference=sr
+                   "source_sha256":item.source_sha256 or source_hash(row_reference_bytes(item)),"source_is_original":True}
+    item.identity_profile=json.dumps(p,ensure_ascii=False)
+    sha=item.source_sha256 or source_hash(row_reference_bytes(item))
+    item.major_reference_path=store_derived_image(pr,sha,"major") if pr else ""
+    item.minor_reference_path=store_derived_image(sr,sha,"minor") if sr else ""
+    item.major_reference=None;item.minor_reference=None
     item.analysis_version=REGISTRY_ANALYSIS_VERSION;item.updated_at=datetime.now(timezone.utc)
     db.session.add(item);db.session.commit();return jsonify(item.public_dict())
 
@@ -1895,10 +2004,14 @@ def reanalyze_outdated():
     for item in rows:
         try:
             f=item.fields()
-            p,pr,sr=analyze_registration_image(item.reference_image,f["registration_name"],f["display_name"],[],item.hint_text)
+            p,pr,sr=analyze_registration_image(row_reference_bytes(item),f["registration_name"],f["display_name"],[],item.hint_text)
             p["registry"]={"schema_version":REGISTRY_SCHEMA_VERSION,"analysis_version":REGISTRY_ANALYSIS_VERSION,
-                           "source_sha256":item.source_sha256 or source_hash(item.reference_image),"source_is_original":True}
-            item.identity_profile=json.dumps(p,ensure_ascii=False);item.major_reference=pr;item.minor_reference=sr
+                           "source_sha256":item.source_sha256 or source_hash(row_reference_bytes(item)),"source_is_original":True}
+            item.identity_profile=json.dumps(p,ensure_ascii=False)
+            sha=item.source_sha256 or source_hash(row_reference_bytes(item))
+            item.major_reference_path=store_derived_image(pr,sha,"major") if pr else ""
+            item.minor_reference_path=store_derived_image(sr,sha,"minor") if sr else ""
+            item.major_reference=None;item.minor_reference=None
             item.analysis_version=REGISTRY_ANALYSIS_VERSION;item.updated_at=datetime.now(timezone.utc)
             db.session.add(item);done+=1
         except Exception:pass
@@ -1930,8 +2043,10 @@ def entry_profile(item_id):
 def entry_reference_image(item_id):
     if not require_admin(): return jsonify(error="unauthorized"),401
     item=db.session.get(Link,item_id)
-    if not item or not item.reference_image:return jsonify(error="not found"),404
-    return Response(item.reference_image,mimetype="image/jpeg")
+    if not item:return jsonify(error="not found"),404
+    raw=row_reference_bytes(item)
+    if not raw:return jsonify(error="image not found"),404
+    return Response(raw,mimetype="image/jpeg")
 
 @app.get("/api/index")
 def registry_index():
@@ -2245,7 +2360,7 @@ def resolve_frame():
         except Exception:p={}
         fp=p.get("full_visual",{}).get("sift",{})
         if not fp:
-            fp=sift_fingerprint(row.reference_image)
+            fp=sift_fingerprint(row_reference_bytes(row))
 
         sd=sift_homography_score_prepared(fp,live_sift)
         visual=float(sd.get("score",0) or 0)
@@ -2257,13 +2372,44 @@ def resolve_frame():
         te_spatial=spatial_row_text_evidence(
             row,live_ocr_regions,sd.get("target_roi")
         )
-        te_final=te_spatial if te_spatial.get("spatial_bound") else {
-            "score":0.0,"exact":False,"live":"","hint":"",
-            "source":"TEXT_OUTSIDE_TARGET_ROI",
-            "bound_region_count":te_spatial.get("bound_region_count",0),
-            "bound_texts":te_spatial.get("bound_texts",[]),
-            "spatial_bound":False,
-        }
+
+        # If this V0.8.2.5 client supplied OCR boxes, final text must be spatially
+        # bound. If an older client supplied no boxes, do NOT zero a genuine match:
+        # allow exact/strong global text only when SIFT is independently strong.
+        spatial_available=bool(live_ocr_regions)
+        if te_spatial.get("spatial_bound"):
+            te_final=te_spatial
+        elif not spatial_available:
+            inl=int(sd.get("inliers",0) or 0)
+            cov=float(sd.get("coverage",0) or 0)
+            err=sd.get("median_error")
+            err=float(err) if err is not None else 99.0
+            fallback_ok=bool(
+                te_global.get("score",0)>=88.0 and
+                visual>=80.0 and inl>=35 and cov>=0.20 and err<=2.5
+            )
+            if fallback_ok:
+                te_final=dict(te_global)
+                te_final.update({
+                    "source":"TEXT_GLOBAL_FALLBACK_STRONG_VISUAL",
+                    "bound_region_count":0,"bound_texts":[],
+                    "spatial_bound":False,
+                })
+            else:
+                te_final={
+                    "score":0.0,"exact":False,"live":"","hint":"",
+                    "source":"TEXT_SPATIAL_UNAVAILABLE",
+                    "bound_region_count":0,"bound_texts":[],
+                    "spatial_bound":False,
+                }
+        else:
+            te_final={
+                "score":0.0,"exact":False,"live":"","hint":"",
+                "source":"TEXT_OUTSIDE_TARGET_ROI",
+                "bound_region_count":te_spatial.get("bound_region_count",0),
+                "bound_texts":te_spatial.get("bound_texts",[]),
+                "spatial_bound":False,
+            }
 
         passed,reason,required=one_frame_decision(
             float(te_final["score"]),bool(te_final["exact"]),visual,sd,emb
@@ -2295,6 +2441,7 @@ def resolve_frame():
             "text_hint":te_final["hint"],
             "text_source":te_final["source"],
             "text_spatial_bound":bool(te_final.get("spatial_bound")),
+            "text_spatial_available":spatial_available,
             "text_bound_region_count":te_final.get("bound_region_count",0),
             "text_bound_texts":te_final.get("bound_texts",[]),
             "global_text_score":te_global["score"],
@@ -2331,7 +2478,7 @@ def resolve_frame():
         candidate_count=len(candidates),
         candidate_mode=candidate_mode,
         frame_mode="FULL_SELECTED_FRAME",
-        text_binding_mode="SIFT_ROI_SPATIAL_V1",
+        text_binding_mode="SIFT_ROI_SPATIAL_V2",
         ocr_region_count=len(live_ocr_regions),
         elapsed_ms=elapsed,
         version=VERSION
@@ -2424,7 +2571,7 @@ def hybrid_verify():
             try:p=json.loads(row.identity_profile or "{}")
             except Exception:p={}
             fp=p.get("full_visual",{}).get("sift",{})
-            if not fp: fp=sift_fingerprint(row.reference_image)
+            if not fp: fp=sift_fingerprint(row_reference_bytes(row))
             sd=sift_homography_score_prepared(fp,live_sift)
             visual=float(sd.get("score",0) or 0)
             text=float(d["text_score"])
@@ -2487,7 +2634,7 @@ def qr_fast_verify():
 
         fp=p.get("full_visual",{}).get("sift",{})
         if not fp:
-            fp=sift_fingerprint(row.reference_image)
+            fp=sift_fingerprint(row_reference_bytes(row))
 
         sd=sift_homography_score_prepared(fp,live_sift)
         visual=float(sd.get("score",0.0))
@@ -2605,7 +2752,7 @@ def fast_verify():
             p={}
         mv=p.get("full_visual",{}).get("multiview_sift",{})
         if not mv:
-            mv=build_multiview_sift(row.reference_image)
+            mv=build_multiview_sift(row_reference_bytes(row))
 
         best=None
         frames_tested=0
@@ -2875,6 +3022,9 @@ def migrate():
         ("match_mode", "VARCHAR(30)"),
         ("major_reference", "BLOB"),
         ("minor_reference", "BLOB"),
+        ("reference_image_path", "VARCHAR(800) DEFAULT ''"),
+        ("major_reference_path", "VARCHAR(800) DEFAULT ''"),
+        ("minor_reference_path", "VARCHAR(800) DEFAULT ''"),
         ("identity_profile", "TEXT"),
         ("group_name", "VARCHAR(300)"),
         ("action_name", "VARCHAR(300)"),
@@ -2907,11 +3057,40 @@ def migrate():
           action_name=COALESCE(action_name,'')
         """))
 
+    # V0.8.2.5: move legacy image BLOBs into version-independent DB/images.
+    # IDs and registration metadata are preserved. Once file write succeeds,
+    # legacy image BLOBs are emptied to keep code/database payload small.
+    for row in Link.query.all():
+        try:
+            legacy=bytes(row.reference_image or b"")
+            if legacy and not (row.reference_image_path or "").strip():
+                sha=row.source_sha256 or source_hash(legacy)
+                row.reference_image_path=store_original_image(
+                    legacy,sha,row.original_filename
+                )
+                row.source_sha256=sha
+            if row.major_reference and not (row.major_reference_path or "").strip():
+                sha=row.source_sha256 or (source_hash(legacy) if legacy else str(row.id))
+                row.major_reference_path=store_derived_image(row.major_reference,sha,"major")
+            if row.minor_reference and not (row.minor_reference_path or "").strip():
+                sha=row.source_sha256 or (source_hash(legacy) if legacy else str(row.id))
+                row.minor_reference_path=store_derived_image(row.minor_reference,sha,"minor")
+
+            # Only clear BLOBs after source image is confirmed readable from file.
+            if row.reference_image_path and load_stored_image(row.reference_image_path):
+                row.reference_image=b""
+                row.major_reference=None
+                row.minor_reference=None
+            db.session.add(row)
+        except Exception:
+            db.session.rollback()
+    db.session.commit()
+
     # Preserve existing IDs and human metadata; only backfill new metadata.
     for row in Link.query.all():
         if not row.schema_version: row.schema_version=REGISTRY_SCHEMA_VERSION
         if not row.analysis_version: row.analysis_version="legacy"
-        if not row.source_sha256 and row.reference_image: row.source_sha256=source_hash(row.reference_image)
+        if not row.source_sha256 and row_reference_bytes(row): row.source_sha256=source_hash(row_reference_bytes(row))
         if not row.updated_at: row.updated_at=row.created_at or datetime.now(timezone.utc)
         db.session.add(row)
     db.session.commit()
@@ -2931,9 +3110,12 @@ def migrate():
         needs_rebuild = (not current or not current.get("full_visual", {}).get("sift", {}).get("npz_b64"))
         if needs_rebuild:
             try:
-                p,pr,sr=analyze_registration_image(row.reference_image,f["registration_name"],f["display_name"])
+                p,pr,sr=analyze_registration_image(row_reference_bytes(row),f["registration_name"],f["display_name"])
                 row.identity_profile=json.dumps(p,ensure_ascii=False)
-                row.major_reference=pr;row.minor_reference=sr
+                sha=row.source_sha256 or source_hash(row_reference_bytes(row))
+                row.major_reference_path=store_derived_image(pr,sha,"major") if pr else ""
+                row.minor_reference_path=store_derived_image(sr,sha,"minor") if sr else ""
+                row.major_reference=None;row.minor_reference=None
                 row.match_mode="CONTEXT_VISUAL"
                 row.recognition_text=" | ".join(p.get("context",{}).get("recognition_terms",[]))
                 changed = True
