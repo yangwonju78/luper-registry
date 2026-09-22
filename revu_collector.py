@@ -117,6 +117,13 @@ def revu_health():
     )
 
 
+@revu_bp.get("/auth-check")
+def revu_auth_check():
+    if not _authorized():
+        return jsonify(ok=False, error="unauthorized"), 401
+    return jsonify(ok=True, authenticated=True, service="LUPER REVU collector")
+
+
 @revu_bp.post("/collect/baemin")
 def collect_baemin():
     if not _authorized():

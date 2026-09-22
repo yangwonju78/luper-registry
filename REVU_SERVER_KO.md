@@ -5,6 +5,7 @@ LUPER의 기존 Render 웹 서비스 안에서 동작하는 독립 수집 모듈
 ## 현재 검증 범위
 
 - 상태 확인: `GET /api/revu/health`
+- 접속 키 확인: `GET /api/revu/auth-check`
 - 배민 수집: `POST /api/revu/collect/baemin`
 - 요청 중 전달된 로그인 헤더와 수집 결과는 DB·디스크에 저장하지 않습니다.
 - 요청 대상은 `https://self-api.baemin.com/v1/review/shops/.../reviews`로 제한됩니다.
