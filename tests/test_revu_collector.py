@@ -53,6 +53,17 @@ class RevuCollectorTest(unittest.TestCase):
         response = self.client.post("/api/revu/collect/baemin", json={})
         self.assertEqual(response.status_code, 401)
 
+    def test_auth_check_accepts_valid_key(self):
+        response = self.client.get(
+            "/api/revu/auth-check", headers={"X-Revu-Key": "test-secret"}
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.get_json()["authenticated"])
+
+    def test_auth_check_rejects_missing_key(self):
+        response = self.client.get("/api/revu/auth-check")
+        self.assertEqual(response.status_code, 401)
+
     def test_rejects_non_baemin_url(self):
         response = self.client.post(
             "/api/revu/collect/baemin",
