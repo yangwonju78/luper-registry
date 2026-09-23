@@ -14,10 +14,8 @@ import numpy as np
 from flask import Flask, Response, jsonify, request
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import inspect, text as sql_text
-from revu_collector import revu_bp
 
 app = Flask(__name__)
-app.register_blueprint(revu_bp)
 
 # Registry storage is version-independent.
 # Code can be replaced without replacing server/DB.
